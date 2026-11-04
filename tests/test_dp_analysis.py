@@ -18,6 +18,7 @@ from gurobipy import GRB
 
 import main
 from src.analysis import analyse_dp, export_dp_analysis
+from src.data_loader import load_community
 from src.model import CommunityModel, CommunityResult, ReferenceResult, get_model_configuration
 from src.plotting import plot_feeder_import
 
@@ -151,7 +152,7 @@ class DPAnalysisTests(unittest.TestCase):
         with patch('main.solve_community', side_effect=lambda c, model_type, verbose: results[model_type]) as solver, \
              patch('main.plot_feeder_import') as plot, redirect_stdout(io.StringIO()):
             main.run_dp_cap_only(community, folder, verbose=True)
-        self.assertEqual([call.kwargs['model_type'] for call in solver.call_args_list], ['DP', 'R', 'I', 'C'])
+        self.assertEqual([call.kwargs['model_type'] for call in solver.call_args_list], ['R', 'I', 'C', 'DP'])
         self.assertTrue(all(call.kwargs['verbose'] for call in solver.call_args_list))
         plot.assert_not_called()
         self.assertEqual([path.name for path in folder.iterdir()], ['cap_only.json'])
@@ -248,7 +249,7 @@ class DPAnalysisTests(unittest.TestCase):
 
     def test_budget_balance_solver_status_handling(self):
         opt = object.__new__(CommunityModel)
-        opt.config = SimpleNamespace(model_type='DP', budget_balance=True)
+        opt.config = SimpleNamespace(model_type='DP', budget_balance=True, individual_rationality=False)
         for status, label in ((GRB.INFEASIBLE, 'INFEASIBLE'), (GRB.TIME_LIMIT, 'TIME_LIMIT')):
             opt.model = SimpleNamespace(Status=status, SolCount=0, optimize=lambda: None)
             with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, label):
@@ -259,6 +260,106 @@ class DPAnalysisTests(unittest.TestCase):
              self.assertWarnsRegex(RuntimeWarning, 'not proven optimal'):
             self.assertEqual(opt.solve(), 'incumbent')
         extract.assert_called_once()
+
+    def test_individual_rationality_configuration_and_cli(self):
+        community = self.case[0]
+        config = get_model_configuration(community, 'DP', budget_balance=True, individual_rationality=True)
+        self.assertTrue(config.individual_rationality)
+        self.assertFalse(get_model_configuration(community, 'DP', budget_balance=True).individual_rationality)
+        for kind, bb in (('DP', False), ('R', True), ('I', True), ('C', True)):
+            with self.subTest(model=kind), self.assertRaises(ValueError):
+                get_model_configuration(community, kind, budget_balance=bb, individual_rationality=True)
+        with patch('sys.argv', ['main.py', '--model', 'DP', '--budget-balance', '--individual-rationality']), \
+             patch('main.load_community', return_value=community), \
+             patch('main.run_dp_cap_only') as runner, redirect_stdout(io.StringIO()):
+            main.main()
+        self.assertTrue(runner.call_args.kwargs['individual_rationality'])
+        for args in (['--model', 'DP', '--individual-rationality'],
+                     ['--model', 'R', '--budget-balance', '--individual-rationality']):
+            with self.subTest(args=args), patch('sys.argv', ['main.py'] + args), \
+                 redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                main.main()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_ir_rows_restrict_only_the_bb_model(self):
+        community = load_community('base')
+        refs = {cid: float(i + 1) for i, cid in enumerate(community.member_ids)}
+        models = []
+        try:
+            for ir in (False, True):
+                opt = CommunityModel(community, 'DP', budget_balance=True,
+                                     individual_rationality=ir, reference_costs_DKK=refs).build()
+                models.append(opt.model)
+                opt.model.update()
+                rows = [row for row in opt.model.getConstrs() if row.ConstrName.startswith('individual_rationality_')]
+                self.assertEqual(len(rows), 16 if ir else 0)
+                for cid in community.member_ids if ir else ():
+                    row = opt.model.getConstrByName(f'individual_rationality_{cid}')
+                    dual = opt.follower_dual_objectives[cid]
+                    self.assertEqual(row.Sense, GRB.LESS_EQUAL)
+                    self.assertAlmostEqual(row.RHS, refs[cid] - dual.getConstant())
+                    actual = {opt.model.getRow(row).getVar(j).VarName: opt.model.getRow(row).getCoeff(j)
+                              for j in range(opt.model.getRow(row).size())}
+                    expected = {}
+                    for j in range(dual.size()):
+                        name = dual.getVar(j).VarName
+                        expected[name] = expected.get(name, 0.0) + dual.getCoeff(j)
+                    self.assertEqual(actual, {name: value for name, value in expected.items() if value != 0})
+                self.assertIsNotNone(opt.model.getConstrByName('budget_balance'))
+                self.assertEqual(opt.model.NumQConstrs, 0)
+                self.assertFalse(opt.model.IsQP)
+            self.assertEqual(models[1].NumConstrs - models[0].NumConstrs, 16)
+            self.assertEqual(models[1].NumVars, models[0].NumVars)
+            self.assertEqual(models[1].NumSOS, models[0].NumSOS)
+            self.assertEqual(models[1].NumGenConstrs, models[0].NumGenConstrs)
+        finally:
+            for model in models:
+                model.dispose()
+
+    def test_ir_requires_complete_finite_reference_costs(self):
+        opt = object.__new__(CommunityModel)
+        opt.blocks = {'buyer': None, 'supplier': None}
+        for refs in (None, {'buyer': 1.0}, {'buyer': 1.0, 'supplier': 2.0, 'extra': 3.0},
+                     {'buyer': float('nan'), 'supplier': 1.0},
+                     {'buyer': float('inf'), 'supplier': 1.0}):
+            opt.reference_costs_DKK = refs
+            with self.subTest(refs=refs), self.assertRaises(ValueError):
+                opt._build_individual_rationality()
+
+    def test_ir_actual_cost_validation_and_export(self):
+        folder = self.temporary_output()
+        export_dp_analysis(analyse_dp(*self.case), folder)
+        dp = self.case[-1]
+        dp.budget_balance = True
+        dp.internal_prices = np.array([2.75, 2.0])
+        for member in self.case[0].members:
+            own = dp.member_results[member.consumer_id]
+            own.objective_DKK = float(dp.internal_prices @ own.net_exchange_kW
+                                      + member.pv_marginal_cost * own.pv_kW.sum())
+        export_dp_analysis(analyse_dp(*self.case), folder)
+        previous = {path.name: path.read_bytes() for path in folder.iterdir()}
+        dp.individual_rationality = True
+        # The existing reference of -3 is below this supplier's -2.85 DP bill.
+        with self.assertRaisesRegex(ValueError, 'supplier is worse off than Model R'):
+            analyse_dp(*self.case)
+        self.case[1]['supplier'].objective_DKK = -2.8
+        result = analyse_dp(*self.case)
+        self.assertTrue(result.summary['individual_rationality_validation_passed'])
+        self.assertEqual(result.summary['worse_off_vs_R_count'], 0)
+        export_dp_analysis(result, folder)
+        self.assertEqual({path.name for path in folder.iterdir()},
+                         {'cap_only.json', 'budget_balance.json', 'budget_balance_ir.json'})
+        for name, content in previous.items():
+            self.assertEqual((folder / name).read_bytes(), content)
+        # Verify the runner passes R costs once, after the three benchmarks.
+        community, reference, individual, centralized, dp = self.case
+        with patch('main.solve_community', side_effect=[reference, individual, centralized, dp]) as solver, \
+             redirect_stdout(io.StringIO()):
+            main.run_dp_cap_only(community, folder, budget_balance=True, individual_rationality=True)
+        self.assertEqual([call.kwargs['model_type'] for call in solver.call_args_list], ['R', 'I', 'C', 'DP'])
+        self.assertEqual(solver.call_args.kwargs['reference_costs_DKK'],
+                         {cid: own.objective_DKK for cid, own in reference.items()})
+        self.assertTrue(solver.call_args.kwargs['individual_rationality'])
 
 
 if __name__ == '__main__':

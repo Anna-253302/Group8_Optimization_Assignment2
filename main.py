@@ -126,18 +126,26 @@ def run_base_case(
     return results
 
 
-def run_dp_cap_only(community, output_dir, *, verbose=False, budget_balance=False):
+def run_dp_cap_only(community, output_dir, *, verbose=False, budget_balance=False,
+                    individual_rationality=False):
     """Solve each of DP/R/I/C once and report the deterministic Q2 experiment.
 
     output_dir is the DP directory; Q1 runners and their exports
-    are separate. Budget balance is optional; individual rationality is diagnostic.
+    are separate. IR optionally adds participation constraints against Model R to BB.
     """
     started = time.perf_counter()
+    if individual_rationality and not budget_balance:
+        raise ValueError('Individual rationality requires Budget Balance')
     results = {}
     variant = 'Budget Balance' if budget_balance else 'Cap Only'
-    for kind in ('DP', 'R', 'I', 'C'):
+    if individual_rationality:
+        variant += ' + Individual Rationality'
+    for kind in ('R', 'I', 'C', 'DP'):
         print(f'\nSolving Model {kind} for DP {variant}...', flush=True)
         options = {'budget_balance': True} if kind == 'DP' and budget_balance else {}
+        if kind == 'DP' and individual_rationality:
+            options.update(individual_rationality=True, reference_costs_DKK={
+                cid: result.objective_DKK for cid, result in results['R'].items()})
         results[kind] = solve_community(community, model_type=kind, verbose=verbose, **options)
     analysis = analyse_dp(community, results['R'], results['I'], results['C'], results['DP'])
     output_path = export_dp_analysis(analysis, output_dir)
@@ -160,6 +168,8 @@ def run_dp_cap_only(community, output_dir, *, verbose=False, budget_balance=Fals
     requirement = 'enforced' if budget_balance else 'diagnostic'
     print(f"Manager surplus: {s['manager_surplus_DKK']:.6f} DKK; budget balanced: {s['manager_budget_balanced']} ({requirement})")
     print('Members worse off vs R:', ', '.join(s['worse_off_vs_R']) or 'none')
+    if individual_rationality:
+        print('Individual rationality against Model R: enforced and validated for all members')
     print('Members worse off vs I:', ', '.join(s['worse_off_vs_I']) or 'none')
     print(f"Accounting residual: {s['accounting_identity_residual_DKK']:.3g} DKK; validation: PASS")
     print(f'DP results saved to {output_path} ({time.perf_counter() - started:.1f} s)')
@@ -316,6 +326,8 @@ def main() -> None:
                     help="R, I, C, DP (Q2 Cap Only), both (R+I), all (R+I+C), or none")
     ap.add_argument("--verbose-solver", action="store_true", help="Show Gurobi solver output")
     ap.add_argument("--budget-balance", action="store_true", help="Enforce budget balance (requires --model DP)")
+    ap.add_argument("--individual-rationality", action="store_true",
+                    help="Enforce individual rationality for DP + Budget Balance")
     ap.add_argument("--settlement", action="store_true",
                     help="Calculate member benefits and manager budget (requires --model all)")
     ap.add_argument("--sensitivity", choices=["discount", "cap", "both"],
@@ -330,6 +342,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.budget_balance and args.model != 'DP':
         ap.error('--budget-balance requires --model DP')
+    if args.individual_rationality and (args.model != 'DP' or not args.budget_balance):
+        ap.error('--individual-rationality requires --model DP --budget-balance')
     if args.model == "DP" and (args.settlement or args.sensitivity or args.reference_diagnostics):
         ap.error("DP has its own analysis; --settlement, --sensitivity and --reference-diagnostics are Q1-only")
     if (args.settlement or args.sensitivity) and args.model != "all":
@@ -353,7 +367,7 @@ def main() -> None:
             print(member.summary(), "\n")
     if args.model == "DP":
         run_dp_cap_only(community, output_dir / "DP", verbose=args.verbose_solver,
-                        budget_balance=args.budget_balance)
+                        budget_balance=args.budget_balance, individual_rationality=args.individual_rationality)
     else:
         run_base_case(community, output_dir, model=args.model, settlement=args.settlement,
                       reference_diagnostics=args.reference_diagnostics, verbose=args.verbose_solver)

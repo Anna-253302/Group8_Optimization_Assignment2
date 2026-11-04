@@ -271,6 +271,24 @@ actual prices and exchanges. Infeasibility or no incumbent raises an explicit
 solver-status error without writing a successful result or relaxing BB. A
 time-limited incumbent is reported with its actual gap, not as a proven optimum.
 
+For **DP + BB + Individual Rationality**, run:
+
+```bash
+python main.py --model DP --day d1 --budget-balance --individual-rationality
+```
+
+IR requires each member's total DP bill (internal payment plus PV cost and
+disutility) to be no greater than its optimal Model R cost: R is the outside
+option without a contract. The runner solves R/I/C once before DP and passes
+the fixed R member costs into 16 linear inequalities on the existing follower
+dual objectives. IR requires BB; neither KKT, the objective nor price bounds
+change. Analysis independently checks actual member bills against R within
+`1e-5` DKK and retains all BB checks. This variant writes only
+`results/<community>/<day>/DP/budget_balance_ir.json`, preserving the other
+variants. A proven infeasible result is distinguished from a time limit without
+an incumbent; neither produces a successful result JSON. A time-limited feasible
+incumbent reports its actual status/gap. No requirements are automatically relaxed.
+
 Analysis checks hourly power balance, nonnegative meter flows, actual positive-part
 cap exceedance, both community cost breakdowns, member bills, payment aggregation,
 the manager accounting identity and C's lower-bound cost. Checks use absolute
