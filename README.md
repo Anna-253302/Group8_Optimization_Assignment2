@@ -1,8 +1,8 @@
 # 46750 - Assignment 2: An Energy Community as a Flexibility Provider
 
-Starter package for **Group Assignment 2** of *46750 - Optimization in Modern Power Systems* (DTU).
-It contains the input data of every question (in `data/`), the Assignment 1 data loader extended to a
-community and the scenario-generation module of Question 3 (in `src/`), and the instructions below.
+Group 8's implementation of **Assignment 2** of *46750 - Optimization in Modern Power Systems* (DTU).
+Q1 implements R, I and C with reproducible settlement and contract studies.
+The existing data loader and Question 3 scenario-generation module are retained.
 The assignment text (*Assignment 2 - Instructions* in DTU Learn) is the reference for the questions; this
 README documents the data and the code conventions.
 
@@ -50,20 +50,197 @@ conditions, big-M or SOS1 complementarity, strong-duality linearization of the p
 
 ### 1.3 Check that everything works
 ```bash
-python main.py                  # loads the base case (16 members, day d1) and prints a summary
-python main.py --members        # ... plus the Assignment 1 summary of every member
-python main.py --demo           # ... plus the scenario-generation demonstration (Question 3)
+python main.py                  # solves R, I and C for the base case
+python main.py --model none --members  # inspect member inputs without solving
+python main.py --model none --demo     # inspect the Question 3 scenario demonstration
+```
+
+### 1.4 Question 1: internal settlement and individual rationality
+
+Run the base-case dispatch and settlement with both member benchmarks:
+
+```bash
+python main.py --model all --day d1 --settlement
+```
+
+The current unified Q1 LPs also exceed the restricted Gurobi licence size; use
+the academic licence for this command. All models use one-hour intervals and
+cyclic batteries (`SoC[24] = SoC[0]`). Settlement changes no dispatch decisions.
+
+`analyse_settlement` in `src/analysis.py` uses C's existing balance duals. The balance is
+`P_imp - P_exp == sum(q_i)`, so the internal price is Gurobi's `Pi`, with no
+sign flip for this formulation. A member pays `sum_t Pi[t] * q_i[t]` and also
+bears its own PV production cost and load disutility. It does not pay external
+tariffs or penalties again. Positive payments are paid to the manager; negative
+payments are receipts from the manager. Positive gains mean savings against R
+or I; individual rationality allows a numerical tolerance of 1e-5 DKK.
+
+The manager's surplus is payments collected minus its external energy, tariff
+and penalty bill. Budget balance means equality within that tolerance, not just
+nonnegative revenue. Internal transfers cancel when the members and manager
+are considered together. Therefore:
+
+`sum(settled member costs) = C dispatch objective + manager surplus`.
+
+The command validates this identity, the power balance, external marginal-price
+conditions (including the dual sign), absolute deviations and cost breakdowns.
+With the present single-meter soft-cap formulation, it also verifies that the
+manager's surplus equals the cap rent, `sum_t cap[t] * max(Pi[t] - import_price[t], 0)`.
+It writes the following under `results/base/d1/` (or the selected community/day):
+
+| File | Content |
+|---|---|
+| `settlement_members.csv` | Costs under R and I, C payments and local costs, settled costs, gains and individual-rationality flags for every member |
+| `settlement_hourly.csv` | Internal/external prices, cap and exchange, hourly receipts, external bill and manager surplus |
+| `settlement_summary.json` | Manager budget, members worse off against each benchmark, totals and accounting residual |
+| `cost_breakdown.csv` | Energy, tariffs, PV, disutility and penalties for R, I and C; internal payments are excluded |
+| `settlement_prices.png/.pdf` | Internal price against external prices, with cap hours shaded |
+| `settlement_member_gains.png/.pdf` | Gains against R and I, grouped by disutility class |
+
+No surplus is redistributed in Q1. A collective gain does not establish
+individual rationality. LP schedules and duals can be nonunique: these results
+refer to the particular optimal solution returned by the solver, rather than
+claiming uniqueness. Q2 uses the member benchmarks and studies price design.
+
+Run the accounting checks without solving the full community:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+### 1.5 Question 1: contract sensitivity
+
+The experiment also saves `report_contract_sensitivity.png/.pdf` in each study
+directory. The discount version shows costs only; its unchanged peaks and
+exceedances can be stated in the report text. The cap version shows costs and
+metered peaks for the sampled range `0.8 <= f <= 2.5`, which includes the base
+case and both default break-even brackets. A custom sweep with no points in
+that range uses its full range. Break-even labels show rounded bracket
+midpoints; exact brackets remain in `study.json`.
+
+The existing `costs_and_exceedance.png/.pdf`, `settlement_sensitivity.png/.pdf`
+and all CSV/JSON results retain the complete sweep, including the slack-cap
+limit. The display window changes neither the experiments nor their results.
+R, I and C use the same blue/orange/green colours as the original import plot.
+
+For the Q1 report, use the base-case cost table and hourly import figure,
+the two `report_contract_sensitivity` figures, the member-gain figure and a
+manager-budget table. Use the full-range and hourly-price figures as supporting
+material when needed. Explain the R/I versus C metering difference, and keep
+community dispatch cost separate from members' settled costs.
+
+Run the two one-at-a-time studies, including an optimal-face reference diagnostic:
+
+```bash
+python main.py --day d1 --sensitivity both --reference-diagnostics
+```
+
+For separate experiments:
+
+```bash
+python main.py --day d1 --sensitivity discount --reference-diagnostics
+python main.py --day d1 --sensitivity cap --reference-diagnostics
+```
+
+The discount study varies beta from 0 to 1 (steps of 0.1, plus the base 0.75),
+holding the cap and 10 DKK/kWh penalty fixed. The cap study holds beta=0.75 and
+the penalty fixed, and varies the absolute energy factor f over
+`0.8, 1, 1.1, 1.2, 1.3, 1.4, 1.6, 1.8, 2, 2.5, 3, 4, 6, 8`.
+For the supplied d1 cap, `cap = 9.39 * f / 1.3` kW; f is not a multiplier of
+9.39 kW. The larger values show the slack-cap limit; they are diagnostic
+endpoints rather than recommendations to increase feeder capacity.
+
+Hypotheses specified before the runs: larger discounts and looser caps cannot
+increase the optimal I/C costs; R's dispatch and cost are unchanged; C cannot
+cost more than I under the same contract. A collective saving need not reach
+each member through dual settlement. Member gains and manager rent need not
+vary monotonically. Both worth-signing and not-worth-signing regimes should
+appear, with binding and slack caps.
+
+Every variation is a deep copy; the provided input files are unchanged. R is
+solved once and its schedule is reused for every point. Individual cap shares
+are held fixed and cap profiles are rebuilt proportionally when f changes.
+The provided shares are rounded to six decimals and sum to 1.000001; their
+existing convention and the model's 1e-4 kW cap-sum tolerance are retained to
+keep the base case reproducible.
+
+The code first evaluates the coarse grid and then refines observed aggregate
+break-even crossings against R to brackets no wider than 0.005 in beta or f.
+It does not infer a threshold when no crossing occurs in the sampled range.
+Use `--no-refine` for only the coarse grid. Custom coarse values are supported:
+
+```bash
+python main.py --sensitivity discount --discount-values 0 0.25 0.5 0.75 1
+python main.py --sensitivity cap --cap-factors 0.8 1.3 2 4 8
+```
+
+Outputs are in `results/<community>/<day>/sensitivity/discount/` and `cap/`:
+
+| File | Content |
+|---|---|
+| `metrics.csv` | R/I/C costs and components, savings, peak, gross-metered and net-feeder exceedance, contractual breaches and C's settlement outcomes |
+| `member_benefits.csv` | All members' settled costs, gains and IR flags at every evaluated parameter value |
+| `study.json` | Fixed parameters, sampled values, break-even brackets, validation checks, reference diagnostic and elapsed times |
+| `costs_and_exceedance.png/.pdf` | Costs, aggregate metered exceedance and peaks against the parameter |
+| `settlement_sensitivity.png/.pdf` | Manager surplus and members not worse off against R and I |
+
+Positive savings are reductions relative to the named model. Costs mean the
+community dispatch objective, excluding internal transfers. Members not worse
+off have settled cost at most their own R/I optimum within 1e-5 DKK; they are
+not necessarily strictly better off. The manager's surplus is not redistributed.
+Counts refer to the optimal dispatch/duals returned by the solver, not every
+possible optimal settlement. At beta=1, the external tariff spread vanishes
+and gross-meter decompositions can be additionally nonunique.
+
+R/I aggregate-metered exceedance is `sum_t max(sum_i import_i,t - cap_t, 0)`;
+I's contractual exceedance is instead `sum_i,t max(import_i,t - cap_i,t, 0)`.
+C's contractual exceedance uses its shared-meter import. R has no contractual
+breach or penalty. Net-feeder diagnostics use the positive part of aggregate
+net exchange and do not introduce a network model.
+
+`--reference-diagnostics` calls `reference_exceedance_range` in `src/model.py`.
+It builds a separate R model, fixes its economic objective
+at its optimum and bounds hourly imports. When no hour can switch sides of the
+cap, exceedance is affine on this optimal face and two LPs certify its min/max.
+A differing reference exceedance is labelled `ALT OPT` only when both values
+lie in this certified interval, the economic optimum matches and the primary
+benchmark checks pass. Otherwise it remains `FAIL`; tolerances are unchanged.
+The diagnostic neither changes the reference dispatch nor tunes it toward the
+provided number. It can also be run alongside the existing settlement command:
+
+```bash
+python main.py --model all --day d1 --settlement --reference-diagnostics
 ```
 
 ## 2. Repository structure
 
+The same division of responsibilities as Assignment 1 is used. Experiment
+configurations and orchestration stay in `main.py`; `src/analysis.py` contains
+post-processing. Contract variations return modified copies through
+`with_contract` in `data_loader.py`. The reference diagnostic reuses the
+existing R builder in `model.py`. No separate settlement, sensitivity or
+reference-validation modules are needed.
+
+`run_base_case` and `run_contract_sensitivity` are the experiment entry points.
+`CONTRACT_STUDIES` declares the discount/cap grids and the input fields they
+vary. The shared model and consumer constraints serve every experiment;
+model variants are not copied. Physical/accounting checks, C <= I and cost
+monotonicity checks run with the experiments; the tests additionally check
+analytical small cases, dual signs, invalid data and exported accounting.
+
+Sensitivity outputs are compact: one metrics table, one member-benefits
+table and one metadata JSON per study, plus figures. Full base-case settlement
+exports are retained. Older generated `runs/` directories are not deleted
+when rerunning; the current study no longer creates them.
+
 ```
-main.py                        Entry point: load a community -> summarize (extend with one function per experiment)
+main.py                        CLI, named CONTRACT_STUDIES, base-case and sensitivity runners
 src/
-  data_loader.py               load_community("base", day="d1") -> CommunityData:
-                                 .members     one Assignment 1 InputData per member (same attribute names as in Assignment 1)
-                                 .contract    ContractData: cap, penalty, discount, individual caps and shares of model I
-  scenario_generation.py       Question 3: independent preference scenarios per member, merged into joint scenarios (numpy only)
+  data_loader.py               Read/validate CommunityData; with_contract creates copied input variations
+  model.py                     Shared R/I/C optimization and reference optimal-face diagnostic
+  analysis.py                  Metrics, settlement, consistency checks and CSV/JSON exports
+  plotting.py                  Hourly comparisons, member gains and sensitivity figures
+  scenario_generation.py       Question 3 preference scenarios (unchanged)
 data/
   appliance_params.json        SHARED catalogue (Assignment 1 format): the loads FL_L1-FL_L4 (linear disutility 0.25-2.0 DKK/kWh), PV_01_S, BAT_01_S
   bus_params.json              SHARED connection point: day-1 prices and the grid tariffs (unchanged from Assignment 1)

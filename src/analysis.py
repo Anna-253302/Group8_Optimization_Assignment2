@@ -8,6 +8,9 @@ Power is in kW, with hourly intervals (dt=1 h); energy is in kWh.
 """
 from __future__ import annotations
 
+import csv
+import json
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -123,11 +126,15 @@ def validate_reference(
     *,
     atol: float = 0.11,
     print_table: bool = True,
+    exceedance_range: dict | None = None,
 ) -> dict[str, bool]:
     """Compare R with supplied reference_model_R values for the selected day.
 
     Reference numbers are rounded (typically one decimal place); default
     tolerance 0.11 permits this rounding but still flags material differences.
+    An optional certified optimal-face diagnostic can establish that differing
+    exceedances are both optimal. Its optimum must match this result and the
+    primary benchmark checks must pass. No tolerance is widened.
     Returns a dictionary of pass/fail checks; does not silently assert success.
     """
     expected = community.contract.reference_model_R
@@ -138,6 +145,8 @@ def validate_reference(
         'exceedance_kWh': metrics.exceedance_kWh,
     }
     checks: dict[str, bool] = {}
+    primary_pass = all(abs(fields[key] - float(expected[key])) <= atol
+                       for key in fields if key != 'exceedance_kWh' and key in expected)
     if print_table:
         print(f"{'Metric':<24} {'Calculated':>12} {'Reference':>12} {'Difference':>12} {'Check':>8}")
         print('-' * 73)
@@ -149,10 +158,25 @@ def validate_reference(
         target = float(expected[key])
         diff = actual - target
         passed = abs(diff) <= atol
+        status = "PASS" if passed else "FAIL"
+        if (key == 'exceedance_kWh' and not passed and primary_pass
+                and exceedance_range is not None and exceedance_range.get('certified')
+                and np.isclose(metrics.total_objective_DKK,
+                               exceedance_range['optimal_cost_DKK'], atol=1e-5, rtol=0)):
+            lower = exceedance_range['minimum_exceedance_kWh']
+            upper = exceedance_range['maximum_exceedance_kWh']
+            if lower - 1e-5 <= actual <= upper + 1e-5 and lower - 1e-5 <= target <= upper + 1e-5:
+                passed = True
+                status = "ALT OPT"
         checks[key] = passed
         if print_table:
-            print(f'{key:<24} {actual:>12.3f} {target:>12.3f} {diff:>+12.3f} {"PASS" if passed else "FAIL":>8}')
+            print(f'{key:<24} {actual:>12.3f} {target:>12.3f} {diff:>+12.3f} {status:>8}')
     if print_table:
+        if exceedance_range is not None and exceedance_range.get('certified'):
+            print('Certified optimal R exceedance range: '
+                  f"{exceedance_range['minimum_exceedance_kWh']:.6f} to "
+                  f"{exceedance_range['maximum_exceedance_kWh']:.6f} kWh")
+            print('ALT OPT means both exceedances belong to the optimal economic solution set.')
         print(f'Congested hours: {metrics.congested_hours}')
         print(f'Daily gross export: {metrics.daily_export_kWh:.2f} kWh')
     return checks
@@ -627,3 +651,309 @@ def analyse_centralized_contract(
         community_penalty_DKK=penalty,
         balance_duals=np.asarray(results.balance_duals),
     )
+
+
+# ==========================================================
+# DUAL SETTLEMENT AND MEMBER PARTICIPATION
+# ==========================================================
+
+@dataclass
+class SettlementResult:
+    """Daily DKK totals, member records and hourly prices in DKK/kWh."""
+
+    members: list[dict]
+    hourly: list[dict]
+    costs: dict[str, dict[str, float]]
+    summary: dict
+
+
+def analyse_settlement(
+    community: CommunityData,
+    reference: Mapping[str, ReferenceResult],
+    individual: Mapping[str, ReferenceResult],
+    centralized: CommunityResult,
+    *,
+    tolerance: float = 1e-5,
+) -> SettlementResult:
+    """Settle C using its balance duals and compare every member with R and I.
+
+    The existing model has one-hour intervals. Its balance is
+    ``P_imp - P_exp == sum(q_i)``: Gurobi's RHS marginal (Pi) is the
+    positive internal purchase price, without a sign flip. Check this using
+    marginal external prices, including hours at and above the soft cap.
+    Inputs are not mutated; C's diagnostic member objectives remain undefined.
+    """
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("tolerance must be finite and positive")
+    ids = community.member_ids
+    if not ids or len(ids) != len(set(ids)):
+        raise ValueError("Community must have unique, nonempty member IDs")
+    if centralized.model_type != "C":
+        raise ValueError("Settlement requires centralized Model C")
+    for label, results in (("R", reference), ("I", individual),
+                           ("C", centralized.member_results)):
+        if set(results) != set(ids):
+            raise ValueError(f"{label}: result IDs do not match community members")
+        if any(results[cid].consumer_id != cid for cid in ids):
+            raise ValueError(f"{label}: result consumer_id does not match its key")
+    n = community.members[0].n_hours
+    if any(m.n_hours != n for m in community.members):
+        raise ValueError("All members must have the same horizon")
+
+    def array(value, label):
+        a = np.asarray(value, dtype=float)
+        if a.shape != (n,) or not np.all(np.isfinite(a)):
+            raise ValueError(f"{label}: expected {n} finite hourly values")
+        return a
+
+    def check(actual, expected, label):
+        if not np.allclose(actual, expected, atol=tolerance, rtol=0):
+            raise ValueError(f"Settlement validation failed: {label}")
+
+    beta = float(community.contract.tariff_discount_ratio)
+    alpha = float(community.contract.penalty_DKK_per_kWh)
+    price = array(community.energy_price, "energy price")
+    internal = array(centralized.balance_duals, "balance duals")
+    imp = array(centralized.community_import_kW, "community import")
+    exp = array(centralized.community_export_kW, "community export")
+    cap = array(community.contract.capacity_limit_kW, "community cap")
+    if np.any(imp < -tolerance) or np.any(exp < -tolerance):
+        raise ValueError("Community import and export must be nonnegative")
+    excess = np.maximum(imp - cap, 0.0)
+    check(array(centralized.community_exceedance_kW, "exceedance"), excess,
+          "community exceedance")
+    buy = price + (1 - beta) * community.import_tariff
+    sell = price - (1 - beta) * community.export_tariff
+    # At the cap the subgradient is an interval, not a single marginal price.
+    if np.any(internal < sell - tolerance) or np.any(internal > buy + alpha + tolerance):
+        raise ValueError("Internal prices violate external price bounds; check dual sign")
+    slack_import = (imp > tolerance) & (imp < cap - tolerance)
+    above_cap = imp > cap + tolerance
+    at_cap = (imp > tolerance) & (np.abs(imp - cap) <= tolerance)
+    check(internal[slack_import], buy[slack_import], "slack-import price / dual sign")
+    check(internal[above_cap], (buy + alpha)[above_cap], "above-cap price")
+    check(internal[exp > tolerance], sell[exp > tolerance], "export price")
+    if np.any(internal[at_cap] < buy[at_cap] - tolerance):
+        raise ValueError("Internal price below import price at the binding cap")
+    idle = (imp <= tolerance) & (exp <= tolerance) & (cap > tolerance)
+    if np.any(internal[idle] > buy[idle] + tolerance):
+        raise ValueError("Internal price above import price at an idle, slack meter")
+
+    energy = price * (imp - exp)
+    tariffs = (1 - beta) * (community.import_tariff * imp + community.export_tariff * exp)
+    penalty = alpha * excess
+    external = energy + tariffs + penalty
+    components = ("energy_market_DKK", "grid_tariffs_DKK", "penalty_DKK",
+                  "pv_generation_DKK", "disutility_DKK")
+    costs = {kind: dict.fromkeys(components, 0.0) for kind in ("R", "I", "C")}
+    costs["C"].update(energy_market_DKK=float(energy.sum()),
+                      grid_tariffs_DKK=float(tariffs.sum()),
+                      penalty_DKK=float(penalty.sum()))
+    members = []
+    aggregate_net = np.zeros(n)
+    hourly_payments = np.zeros(n)
+    for member in community.members:
+        cid = member.consumer_id
+        local = {}
+        for kind, result in (("R", reference[cid]), ("I", individual[cid]),
+                             ("C", centralized.member_results[cid])):
+            load = array(result.load_kW, f"{kind}/{cid} load")
+            pv = array(result.pv_kW, f"{kind}/{cid} PV")
+            deviation = array(result.deviation_kW, f"{kind}/{cid} deviation")
+            check(deviation, np.abs(load - member.reference_load),
+                  f"{kind}/{cid} absolute deviation")
+            pv_cost = float(member.pv_marginal_cost * pv.sum())
+            disutility = float(member.linear_disutility * deviation.sum())
+            local[kind] = pv_cost + disutility
+            costs[kind]["pv_generation_DKK"] += pv_cost
+            costs[kind]["disutility_DKK"] += disutility
+            if kind != "C":
+                member_imp = array(result.import_kW, f"{kind}/{cid} import")
+                member_exp = array(result.export_kW, f"{kind}/{cid} export")
+                discount = 0.0 if kind == "R" else beta
+                own_energy = float(np.dot(member.energy_price, member_imp - member_exp))
+                own_tariffs = float((1 - discount) * (
+                    member.import_tariff * member_imp + member.export_tariff * member_exp
+                ).sum())
+                own_penalty = (0.0 if kind == "R" else float(alpha * np.maximum(
+                    member_imp - community.contract.individual_capacity_limit_kW[cid], 0
+                ).sum()))
+                costs[kind]["energy_market_DKK"] += own_energy
+                costs[kind]["grid_tariffs_DKK"] += own_tariffs
+                costs[kind]["penalty_DKK"] += own_penalty
+                check(result.objective_DKK, own_energy + own_tariffs + own_penalty + local[kind],
+                      f"{kind}/{cid} benchmark cost reconstruction")
+        result = centralized.member_results[cid]
+        net = array(result.net_exchange_kW, f"C/{cid} net exchange")
+        charge = np.zeros(n) if result.charge_kW is None else array(result.charge_kW, "charge")
+        discharge = (np.zeros(n) if result.discharge_kW is None
+                     else array(result.discharge_kW, "discharge"))
+        check(net, result.load_kW + charge - result.pv_kW - discharge,
+              f"C/{cid} physical exchange")
+        payments = internal * net
+        payment = float(payments.sum())
+        settled = payment + local["C"]
+        gain_r = float(reference[cid].objective_DKK - settled)
+        gain_i = float(individual[cid].objective_DKK - settled)
+        members.append(dict(
+            consumer_id=cid, archetype=member.archetype, slope_class=member.slope_class,
+            has_pv=member.has_pv, has_battery=member.has_battery,
+            reference_cost_DKK=float(reference[cid].objective_DKK),
+            individual_cost_DKK=float(individual[cid].objective_DKK),
+            net_energy_C_kWh=float(net.sum()), payment_C_DKK=payment,
+            local_cost_C_DKK=local["C"], settled_cost_C_DKK=settled,
+            gain_vs_R_DKK=gain_r, gain_vs_I_DKK=gain_i,
+            individually_rational_vs_R=bool(gain_r >= -tolerance),
+            individually_rational_vs_I=bool(gain_i >= -tolerance)))
+        aggregate_net += net
+        hourly_payments += payments
+
+    check(aggregate_net, imp - exp, "community power balance")
+    check(hourly_payments, internal * (imp - exp), "hourly payment aggregation")
+    for kind in costs:
+        costs[kind]["total_objective_DKK"] = float(sum(costs[kind].values()))
+    check(costs["C"]["total_objective_DKK"], centralized.objective_DKK,
+          "C objective reconstruction")
+    total_payments = float(hourly_payments.sum())
+    grid_bill = float(external.sum())
+    budget = total_payments - grid_bill
+    cap_rent = float(np.dot(np.maximum(internal - buy, 0.0), cap))
+    check(budget, cap_rent, "manager surplus equals the cap rent")
+    total_settled = float(sum(row["settled_cost_C_DKK"] for row in members))
+    identity_residual = total_settled - centralized.objective_DKK - budget
+    check(identity_residual, 0.0, "sum(member costs) = C objective + manager surplus")
+    summary = dict(
+        community=community.community, day=community.day, dt_hours=1.0,
+        balance_dual_sign="Pi (P_import - P_export == sum(member net exchange))",
+        tolerance=tolerance, total_payments_DKK=total_payments,
+        external_energy_DKK=float(energy.sum()), external_tariffs_DKK=float(tariffs.sum()),
+        external_penalty_DKK=float(penalty.sum()), external_bill_DKK=grid_bill,
+        manager_surplus_DKK=budget, manager_budget_balanced=bool(abs(budget) <= tolerance),
+        cap_rent_DKK=cap_rent,
+        total_settled_member_cost_DKK=total_settled,
+        centralized_objective_DKK=float(centralized.objective_DKK),
+        worse_off_vs_R=[r["consumer_id"] for r in members if not r["individually_rational_vs_R"]],
+        worse_off_vs_I=[r["consumer_id"] for r in members if not r["individually_rational_vs_I"]],
+        accounting_identity_residual_DKK=float(identity_residual), validation_passed=True)
+    hourly = [dict(
+        hour=t + 1, internal_price_DKK_per_kWh=float(internal[t]),
+        day_ahead_price_DKK_per_kWh=float(price[t]),
+        discounted_import_price_DKK_per_kWh=float(buy[t]),
+        discounted_export_price_DKK_per_kWh=float(sell[t]),
+        import_kW=float(imp[t]), export_kW=float(exp[t]), cap_kW=float(cap[t]),
+        exceedance_kW=float(excess[t]), payments_collected_DKK=float(hourly_payments[t]),
+        external_bill_DKK=float(external[t]),
+        manager_surplus_DKK=float(hourly_payments[t] - external[t])) for t in range(n)]
+    return SettlementResult(members, hourly, costs, summary)
+
+
+def print_settlement(result: SettlementResult) -> None:
+    """Print daily member costs/benefits and manager receipts/costs in DKK."""
+    print("\nQ1 - DUAL SETTLEMENT (DKK; positive gain means the member benefits)")
+    print(f"{'Member':<12} {'R cost':>10} {'I cost':>10} {'C settled':>11} "
+          f"{'Gain vs R':>11} {'Gain vs I':>11}")
+    for row in result.members:
+        print(f"{row['consumer_id']:<12} {row['reference_cost_DKK']:>10.2f} "
+              f"{row['individual_cost_DKK']:>10.2f} {row['settled_cost_C_DKK']:>11.2f} "
+              f"{row['gain_vs_R_DKK']:>11.2f} {row['gain_vs_I_DKK']:>11.2f}")
+    s = result.summary
+    print(f"Payments collected: {s['total_payments_DKK']:.2f} DKK")
+    print(f"External grid bill: {s['external_bill_DKK']:.2f} DKK")
+    print(f"Manager surplus:   {s['manager_surplus_DKK']:.2f} DKK")
+    print(f"Budget balanced:   {s['manager_budget_balanced']}")
+    print("Members worse off vs R:", ", ".join(s["worse_off_vs_R"]) or "none")
+    print("Members worse off vs I:", ", ".join(s["worse_off_vs_I"]) or "none")
+    print("Settlement validation: PASS")
+
+
+def _write_csv(path, rows):
+    """Write one table; column names retain the quantities and units."""
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def export_settlement(result: SettlementResult, output_dir: Path) -> None:
+    """Write member/hourly/cost CSVs and a strict JSON summary; amounts are DKK."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    records = {
+        "settlement_members.csv": result.members,
+        "settlement_hourly.csv": result.hourly,
+        "cost_breakdown.csv": [dict(model=kind, **costs) for kind, costs in result.costs.items()],
+    }
+    for name, rows in records.items():
+        _write_csv(output_dir / name, rows)
+    (output_dir / "settlement_summary.json").write_text(
+        json.dumps(result.summary, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8")
+
+
+# ==========================================================
+# CONTRACT SENSITIVITY METRICS AND EXPORTS
+# ==========================================================
+
+def analyse_contract_sensitivity(community, reference, individual, centralized, settlement, dimension, value):
+    """Return three rows with explicit metering and contract-exceedance definitions."""
+    rows = []
+    cap = np.asarray(community.contract.capacity_limit_kW)
+    r_cost = settlement.costs["R"]["total_objective_DKK"]
+    i_cost = settlement.costs["I"]["total_objective_DKK"]
+    for kind, results in (("R", reference), ("I", individual),
+                           ("C", centralized.member_results)):
+        if kind == "C":
+            imp = centralized.community_import_kW
+            exp = centralized.community_export_kW
+        else:
+            imp = np.sum([results[cid].import_kW for cid in community.member_ids], axis=0)
+            exp = np.sum([results[cid].export_kW for cid in community.member_ids], axis=0)
+        net_import = np.maximum(imp - exp, 0)
+        aggregate_excess = np.maximum(imp - cap, 0)
+        individual_excess = (float(sum(np.maximum(
+            results[cid].import_kW - community.contract.individual_capacity_limit_kW[cid], 0
+        ).sum() for cid in community.member_ids)) if kind == "I" else None)
+        s = settlement.summary
+        row = dict(
+            dimension=dimension, parameter_value=float(value), model=kind,
+            discount=community.contract.tariff_discount_ratio,
+            cap_factor=community.contract.capacity_limit_daily_energy_factor,
+            cap_min_kW=float(cap.min()), cap_max_kW=float(cap.max()),
+            penalty_DKK_per_kWh=community.contract.penalty_DKK_per_kWh,
+            **settlement.costs[kind],
+            savings_vs_R_DKK=r_cost - settlement.costs[kind]["total_objective_DKK"],
+            savings_vs_I_DKK=i_cost - settlement.costs[kind]["total_objective_DKK"],
+            metered_daily_import_kWh=float(imp.sum()),
+            metered_peak_import_kW=float(imp.max()),
+            aggregate_metered_exceedance_kWh=float(aggregate_excess.sum()),
+            aggregate_metered_exceedance_hours=int(np.count_nonzero(aggregate_excess > 1e-6)),
+            net_feeder_peak_import_kW=float(net_import.max()),
+            net_feeder_exceedance_kWh=float(np.maximum(net_import - cap, 0).sum()),
+            individual_contract_exceedance_kWh=individual_excess,
+            community_contract_exceedance_kWh=float(aggregate_excess.sum()) if kind == "C" else None,
+            cap_binding_hours=int(np.count_nonzero(np.abs(imp - cap) <= 1e-6)),
+            total_absolute_load_deviation_kWh=float(sum(r.deviation_kW.sum() for r in results.values())),
+            manager_surplus_DKK=s["manager_surplus_DKK"] if kind == "C" else None,
+            manager_budget_balanced=s["manager_budget_balanced"] if kind == "C" else None,
+            members_not_worse_off_vs_R=len(community.members) - len(s["worse_off_vs_R"]) if kind == "C" else None,
+            members_not_worse_off_vs_I=len(community.members) - len(s["worse_off_vs_I"]) if kind == "C" else None,
+            worst_member_gain_vs_R_DKK=min(r["gain_vs_R_DKK"] for r in settlement.members) if kind == "C" else None,
+            worst_member_gain_vs_I_DKK=min(r["gain_vs_I_DKK"] for r in settlement.members) if kind == "C" else None)
+        rows.append(row)
+    return rows
+
+
+def export_contract_sensitivity(rows, members, report, output_dir):
+    """Save the combined Q1 study tables and parameters under output_dir.
+
+    rows contains R/I/C metrics (DKK/day, kW and kWh/day); members contains
+    per-member costs and gains at every sampled value. report records the
+    actual contract values, break-even brackets and validation diagnostics.
+    No separate copy of each point's settlement files is needed.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv(output_dir / "metrics.csv", rows)
+    _write_csv(output_dir / "member_benefits.csv", members)
+    (output_dir / "study.json").write_text(
+        json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")

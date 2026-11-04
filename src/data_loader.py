@@ -451,6 +451,38 @@ def list_communities(data_dir: Path | str = DATA_DIR) -> list[str]:
     return sorted(p.stem.removeprefix("params_community_") for p in Path(data_dir).glob("params_community_*.json"))
 
 
+def with_contract(
+    community: CommunityData, *, discount: float | None = None,
+    cap_factor: float | None = None,
+) -> CommunityData:
+    """Copy a case and change beta or absolute cap-energy factor f, never both.
+
+    Cap profiles are scaled by f / f_base, using the supplied (rounded) base
+    profile, and every individual cap is rebuilt from the unchanged shares.
+    The member mix, reference dispatch, penalty and JSON input files are fixed.
+    """
+    if discount is not None and cap_factor is not None:
+        raise ValueError("Change only one contract dimension at a time")
+    if discount is not None and (not np.isfinite(discount) or not 0 <= discount <= 1):
+        raise ValueError("Discount must be finite and in [0, 1]")
+    if cap_factor is not None and (not np.isfinite(cap_factor) or cap_factor <= 0):
+        raise ValueError("Cap factor must be finite and positive")
+    result = copy.deepcopy(community)
+    contract = result.contract
+    if discount is not None:
+        contract.tariff_discount_ratio = float(discount)
+    if cap_factor is not None:
+        base_factor = community.contract.capacity_limit_daily_energy_factor
+        if base_factor <= 0:
+            raise ValueError("Base cap-energy factor must be positive")
+        contract.capacity_limit_kW = np.asarray(contract.capacity_limit_kW) * cap_factor / base_factor
+        contract.capacity_limit_daily_energy_factor = float(cap_factor)
+        contract.capacity_limit_daily_energy_kWh = float(contract.capacity_limit_kW.sum())
+        contract.individual_capacity_limit_kW = {
+            cid: contract.share[cid] * contract.capacity_limit_kW for cid in result.member_ids}
+    return result
+
+
 if __name__ == "__main__":  # quick manual check:  python -m src.data_loader
     for name in list_communities():
         print(load_community(name).summary(), end="\n\n")
