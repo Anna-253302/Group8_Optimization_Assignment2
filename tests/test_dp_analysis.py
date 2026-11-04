@@ -1,4 +1,4 @@
-"""Analytical DP accounting and workflow checks; no optimizer licence required."""
+"""Analytical DP accounting, workflow and small MILP accounting checks."""
 import copy
 import io
 import json
@@ -13,11 +13,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import gurobipy as gp
 from gurobipy import GRB
 
 import main
 from src.analysis import analyse_dp, export_dp_analysis
-from src.model import CommunityResult, ReferenceResult
+from src.model import CommunityModel, CommunityResult, ReferenceResult, get_model_configuration
 from src.plotting import plot_feeder_import
 
 
@@ -169,6 +170,95 @@ class DPAnalysisTests(unittest.TestCase):
                  redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
                 main.main()
             self.assertEqual(error.exception.code, 2)
+
+    def test_budget_balance_configuration_and_cli(self):
+        community = self.case[0]
+        self.assertFalse(get_model_configuration(community, 'DP').budget_balance)
+        self.assertTrue(get_model_configuration(community, 'DP', budget_balance=True).budget_balance)
+        for kind in ('R', 'I', 'C'):
+            with self.subTest(model=kind), self.assertRaisesRegex(ValueError, 'only supported for Model DP'):
+                get_model_configuration(community, kind, budget_balance=True)
+        with patch('sys.argv', ['main.py', '--model', 'DP', '--budget-balance']), \
+             patch('main.load_community', return_value=community), \
+             patch('main.run_dp_cap_only') as runner, redirect_stdout(io.StringIO()):
+            main.main()
+        self.assertTrue(runner.call_args.kwargs['budget_balance'])
+        with patch('sys.argv', ['main.py', '--model', 'C', '--budget-balance']), \
+             redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            main.main()
+        self.assertEqual(error.exception.code, 2)
+
+    def test_budget_balance_analysis_and_separate_export(self):
+        folder = self.temporary_output()
+        export_dp_analysis(analyse_dp(*self.case), folder)
+        original = (folder / 'cap_only.json').read_bytes()
+        dp = self.case[-1]
+        dp.budget_balance = True
+        dp.internal_prices = np.array([2.75, 2.0])  # 2*2.75 - 2 = 3.5 DKK external bill.
+        dp.solver_status = GRB.TIME_LIMIT
+        dp.mip_gap = 0.01
+        for member in self.case[0].members:
+            own = dp.member_results[member.consumer_id]
+            own.objective_DKK = float(dp.internal_prices @ own.net_exchange_kW
+                                      + member.pv_marginal_cost * own.pv_kW.sum())
+        result = analyse_dp(*self.case)
+        self.assertAlmostEqual(result.summary['manager_surplus_DKK'], 0)
+        self.assertTrue(result.summary['budget_balance_validation_passed'])
+        self.assertFalse(result.summary['dp_proven_optimal'])
+        export_dp_analysis(result, folder)
+        self.assertEqual((folder / 'cap_only.json').read_bytes(), original)
+        self.assertEqual({p.name for p in folder.iterdir()}, {'cap_only.json', 'budget_balance.json'})
+        payload = json.loads((folder / 'budget_balance.json').read_text())
+        self.assertEqual(payload['summary']['model_variant'], 'DP_budget_balance')
+
+    def test_budget_balance_rejects_surplus_and_simultaneous_trade(self):
+        dp = self.case[-1]
+        dp.budget_balance = True
+        with self.assertRaisesRegex(ValueError, 'hard budget balance'):
+            analyse_dp(*self.case)
+        # Add simultaneous trade in the export hour; adjust costs and payments
+        # consistently so accounting identities alone cannot detect the problem.
+        dp.community_import_kW[1] = 0.2
+        dp.community_export_kW[1] = 1.2
+        dp.objective_DKK = 3.71
+        dp.internal_prices = np.array([2.78, 2.0])
+        for member in self.case[0].members:
+            own = dp.member_results[member.consumer_id]
+            own.objective_DKK = float(dp.internal_prices @ own.net_exchange_kW
+                                      + member.pv_marginal_cost * own.pv_kW.sum())
+        with self.assertRaisesRegex(ValueError, 'simultaneous community import and export'):
+            analyse_dp(*self.case)
+
+    def test_exact_bb_metering_and_exceedance(self):
+        for imp, exp, excess, feasible in ((2, 1, 1, False), (2, 0, 2, False),
+                                            (2, 0, 1, True), (0, 1, 0, True)):
+            with self.subTest(imp=imp, exp=exp, excess=excess), gp.Model() as model:
+                model.Params.OutputFlag = 0
+                opt = object.__new__(CommunityModel)
+                opt.model, opt.T = model, range(1)
+                opt.community = SimpleNamespace(contract=SimpleNamespace(capacity_limit_kW=[1]))
+                opt.community_import = model.addVars(1, lb=imp, ub=imp)
+                opt.community_export = model.addVars(1, lb=exp, ub=exp)
+                opt.exceedance = model.addVars(1, lb=excess, ub=excess)
+                model.addConstr(opt.exceedance[0] >= opt.community_import[0] - 1)
+                opt._enforce_exact_bb_accounting()
+                model.optimize()
+                self.assertEqual(model.Status, GRB.OPTIMAL if feasible else GRB.INFEASIBLE)
+                self.assertEqual(model.NumQConstrs, 0)
+
+    def test_budget_balance_solver_status_handling(self):
+        opt = object.__new__(CommunityModel)
+        opt.config = SimpleNamespace(model_type='DP', budget_balance=True)
+        for status, label in ((GRB.INFEASIBLE, 'INFEASIBLE'), (GRB.TIME_LIMIT, 'TIME_LIMIT')):
+            opt.model = SimpleNamespace(Status=status, SolCount=0, optimize=lambda: None)
+            with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, label):
+                opt.solve()
+        opt.model = SimpleNamespace(Status=GRB.TIME_LIMIT, SolCount=1,
+                                    MIPGap=0.1, optimize=lambda: None)
+        with patch.object(opt, '_extract_results', return_value='incumbent') as extract, \
+             self.assertWarnsRegex(RuntimeWarning, 'not proven optimal'):
+            self.assertEqual(opt.solve(), 'incumbent')
+        extract.assert_called_once()
 
 
 if __name__ == '__main__':

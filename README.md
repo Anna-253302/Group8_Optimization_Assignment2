@@ -254,6 +254,23 @@ It contains three keys:
 No DP CSVs or plots are generated automatically. Existing output files are left
 in place for manual cleanup. Shared comparison plots will be added later.
 
+For **DP + Budget Balance**, use the same experiment runner with:
+
+```bash
+python main.py --model DP --day d1 --budget-balance
+```
+
+Cap Only remains the default. BB is a hard equality between internal payments
+and the external grid bill; payments use the existing linear follower dual
+objectives minus local costs. The community objective and price bounds are
+unchanged, and IR is not enforced. BB-only SOS1/indicator constraints prevent
+simultaneous import/export and force exact positive-part cap exceedance.
+This variant writes only `results/<community>/<day>/DP/budget_balance.json`,
+without overwriting the Cap Only result. Analysis independently checks BB using
+actual prices and exchanges. Infeasibility or no incumbent raises an explicit
+solver-status error without writing a successful result or relaxing BB. A
+time-limited incumbent is reported with its actual gap, not as a proven optimum.
+
 Analysis checks hourly power balance, nonnegative meter flows, actual positive-part
 cap exceedance, both community cost breakdowns, member bills, payment aggregation,
 the manager accounting identity and C's lower-bound cost. Checks use absolute

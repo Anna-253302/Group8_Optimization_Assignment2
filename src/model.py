@@ -42,8 +42,12 @@ class ModelConfiguration:
 def get_model_configuration(
     community: CommunityData,
     model_type: str,
+    *,
+    budget_balance: bool = False,
 ) -> ModelConfiguration:
     """Return the configuration corresponding to the selected model."""
+    if budget_balance and model_type != 'DP':
+        raise ValueError('Budget balance is only supported for Model DP')
 
     beta = float(community.contract.tariff_discount_ratio)
 
@@ -71,6 +75,7 @@ def get_model_configuration(
             tariff_discount=beta,
             metering="community",
             capacity_contract="community",
+            budget_balance=budget_balance,
         ),
     }
 
@@ -286,6 +291,7 @@ class CommunityResult:
     internal_prices: np.ndarray | None = None
     mip_gap: float | None = None
     solver_status: int | None = None
+    budget_balance: bool = False
 
 
 # ==========================================================
@@ -298,6 +304,7 @@ def solve_community(
     model_type: Literal["R", "I", "C", "DP"] = "R",
     terminal_soc: str = "cyclic",
     verbose: bool = False,
+    budget_balance: bool = False,
 ):
     """
     Solve the selected community optimization configuration.
@@ -305,7 +312,7 @@ def solve_community(
     R: Reference
     I: Individual contracts
     C: Centralized community contract
-    DP: Optimistic dynamic pricing, Cap Only (consumer KKT MILP)
+    DP: Optimistic dynamic pricing (consumer KKT MILP), optionally budget balanced
     """
 
     optimization = CommunityModel(
@@ -313,6 +320,7 @@ def solve_community(
         model_type=model_type,
         terminal_soc=terminal_soc,
         verbose=verbose,
+        budget_balance=budget_balance,
     )
 
     optimization.build()
@@ -569,9 +577,9 @@ class CommunityModel:
     """Shared physical LP for R/I/C; DP adds prices and follower KKT conditions."""
 
     def __init__(self, community: CommunityData, model_type: Literal['R', 'I', 'C', 'DP'] = 'R',
-                 terminal_soc: str = 'cyclic', verbose: bool = False):
+                 terminal_soc: str = 'cyclic', verbose: bool = False, *, budget_balance: bool = False):
         self.community = community
-        self.config = get_model_configuration(community, model_type)
+        self.config = get_model_configuration(community, model_type, budget_balance=budget_balance)
         self.terminal_soc = terminal_soc
         self.model = gp.Model(f'Community_{model_type}')
         self.model.Params.OutputFlag = int(verbose)
@@ -602,6 +610,9 @@ class CommunityModel:
             self._build_internal_prices()
             self._build_follower_optimality()
         self._build_objective()
+        if self.config.model_type == 'DP' and self.config.budget_balance:
+            self._enforce_exact_bb_accounting()
+            self._build_budget_balance()
         return self
 
     def _build_consumers(self):
@@ -737,13 +748,39 @@ class CommunityModel:
         self.model.setObjective(procurement + physical + disutility + self.penalty_cost,
                                 GRB.MINIMIZE)
 
+    def _enforce_exact_bb_accounting(self):
+        """For BB only, exclude simultaneous trade and inflated DSO penalties."""
+        m = self.model
+        active = m.addVars(self.T, vtype=GRB.BINARY, name='bb_cap_exceeded')
+        for t in self.T:
+            m.addSOS(GRB.SOS_TYPE1, [self.community_import[t], self.community_export[t]])
+            m.addGenConstrIndicator(active[t], 0, self.exceedance[t] == 0,
+                                    name=f'bb_zero_exceedance[{t}]')
+            m.addGenConstrIndicator(
+                active[t], 1,
+                self.exceedance[t] == self.community_import[t]
+                - float(self.community.contract.capacity_limit_kW[t]),
+                name=f'bb_exact_exceedance[{t}]')
+
+    def _build_budget_balance(self):
+        """Enforce zero manager surplus using linear follower-duality payments."""
+        payments = gp.quicksum(
+            self.follower_dual_objectives[cid] - block.physical_cost - block.disutility_cost
+            for cid, block in self.blocks.items())
+        external = self.objective_components['procurement'] + self.objective_components['penalty']
+        self.model.addConstr(payments == external, name='budget_balance')
+
     def solve(self):
         self.model.optimize()
         if self.model.Status != GRB.OPTIMAL:
             if self.config.model_type != 'DP' or self.model.SolCount == 0:
                 detail = '; no feasible incumbent available' if self.model.SolCount == 0 else ''
+                status = {GRB.INFEASIBLE: 'INFEASIBLE', GRB.TIME_LIMIT: 'TIME_LIMIT',
+                          GRB.INF_OR_UNBD: 'INF_OR_UNBD', GRB.UNBOUNDED: 'UNBOUNDED'}.get(
+                              self.model.Status, 'solver stopped')
+                variant = 'DP + BB' if self.config.budget_balance else self.config.model_type
                 raise RuntimeError(
-                    f'Model {self.config.model_type}: Gurobi status {self.model.Status}{detail}')
+                    f'Model {variant}: {status} (Gurobi status {self.model.Status}){detail}')
             warnings.warn(
                 f'Model DP: returning a feasible incumbent, not proven optimal; '
                 f'Gurobi status {self.model.Status}, MIP gap {self.model.MIPGap:.6g}',
@@ -802,7 +839,7 @@ class CommunityModel:
                                if self.config.model_type == 'C' else None),
                 internal_prices=prices,
                 mip_gap=float(self.model.MIPGap) if self.config.model_type == 'DP' else None,
-                solver_status=int(self.model.Status))
+                solver_status=int(self.model.Status), budget_balance=self.config.budget_balance)
         total = sum(r.objective_DKK for r in results.values())
         if not np.isclose(total, self.model.ObjVal, atol=1e-5):
             raise RuntimeError(f'Member costs ({total}) differ from model objective ({self.model.ObjVal})')

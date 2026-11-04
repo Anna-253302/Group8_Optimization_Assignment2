@@ -1038,6 +1038,10 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
     check(total_payments, sum(row['payment_DP_DKK'] for row in members), 'daily payment aggregation')
     external_bill = float(external.sum())
     surplus = total_payments - external_bill
+    if dp.budget_balance:
+        if np.any((imp > tolerance) & (exp > tolerance)):
+            raise ValueError('DP + BB validation failed: simultaneous community import and export')
+        check(surplus, 0.0, 'hard budget balance from actual prices and exchanges')
     total_settled = sum(row['settled_cost_DP_DKK'] for row in members)
     residual = float(total_settled - objectives['DP'] - surplus)
     check(residual, 0.0, 'sum(member costs) = DP objective + manager surplus')
@@ -1052,7 +1056,8 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
         raise ValueError('MIP gap must be nonnegative')
     difference = internal - c_price
     summary = dict(
-        community=community.community, day=community.day, model_variant='DP_cap_only',
+        community=community.community, day=community.day,
+        model_variant='DP_budget_balance' if dp.budget_balance else 'DP_cap_only',
         dt_hours=1.0, tolerance=tolerance, relative_tolerance=0.0,
         units=dict(costs='DKK/day', prices='DKK/kWh', power='kW', energy='kWh/day', mip_gap='fraction'),
         objectives_DKK=objectives, efficiency_loss_DKK=efficiency_loss,
@@ -1074,6 +1079,9 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
         worse_off_vs_I=[row['consumer_id'] for row in members if not row['individually_rational_vs_I']],
         accounting_identity_residual_DKK=residual, validation_passed=True,
         interpretation_note='Optimistic follower responses may be nonunique. Equal community costs do not imply equal prices or schedules. BB and IR are diagnostics only; no surplus is redistributed.')
+    if dp.budget_balance:
+        summary.update(budget_balance_enforced=True, budget_balance_validation_passed=True,
+                       interpretation_note='Optimistic follower responses may be nonunique. Equal community costs do not imply equal prices or schedules. BB is enforced; IR remains diagnostic. No surplus is redistributed.')
     hourly = [dict(
         hour=t + 1, day_ahead_price_DKK_per_kWh=float(price[t]),
         discounted_import_price_DKK_per_kWh=float(buy[t]),
@@ -1097,7 +1105,10 @@ def export_dp_analysis(analysis, output_dir):
     content = json.dumps(payload, indent=2, allow_nan=False) + '\n'
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / 'cap_only.json').write_text(content, encoding='utf-8')
+    filename = 'budget_balance.json' if analysis.summary['model_variant'] == 'DP_budget_balance' else 'cap_only.json'
+    output_path = output_dir / filename
+    output_path.write_text(content, encoding='utf-8')
+    return output_path
 
 
 # ==========================================================
