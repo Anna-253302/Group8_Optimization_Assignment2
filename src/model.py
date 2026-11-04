@@ -658,3 +658,61 @@ class CommunityModel:
         if not np.isclose(total, self.model.ObjVal, atol=1e-5):
             raise RuntimeError(f'Member costs ({total}) differ from model objective ({self.model.ObjVal})')
         return results
+
+
+# ==========================================================
+# REFERENCE OPTIMAL-FACE DIAGNOSTIC
+# ==========================================================
+
+def reference_exceedance_range(community, *, tolerance=1e-7):
+    """Find the min/max gross exceedance on R's optimal face, when linear there.
+
+    A separate model is used. First fix its economic objective at its optimum.
+    Bound the aggregate import in every hour with two LPs. If no hour can cross
+    the cap, total exceedance is affine on this face and two further LPs give
+    its exact range, up to solver tolerances. Otherwise return certified=False;
+    no benchmark is passed without a certified interval. This does not pick a
+    new reference schedule or tune the solution toward the supplied number.
+    """
+    opt = CommunityModel(community, "R").build()
+    model = opt.model
+    try:
+        model.optimize()
+        if model.Status != GRB.OPTIMAL:
+            raise RuntimeError("Reference diagnostic could not optimize R")
+        primary = model.getObjective()
+        optimum = float(model.ObjVal)
+        model.addConstr(primary == optimum, name="fix_reference_economic_optimum")
+        imports = [gp.quicksum(opt.member_import[cid][t] for cid in community.member_ids)
+                   for t in opt.T]
+
+        def solve(expression, sense):
+            model.setObjective(expression, sense)
+            model.optimize()
+            if model.Status != GRB.OPTIMAL:
+                raise RuntimeError("Reference optimal-face diagnostic failed")
+            return float(model.ObjVal)
+
+        ranges = [(solve(expression, GRB.MINIMIZE), solve(expression, GRB.MAXIMIZE))
+                  for expression in imports]
+        lower, upper = np.array(ranges).T
+        cap = np.asarray(community.contract.capacity_limit_kW)
+        above = lower >= cap - tolerance
+        below = upper <= cap + tolerance
+        ambiguous = ~(above | below)
+        report = dict(certified=not bool(ambiguous.any()), optimal_cost_DKK=optimum,
+                      solver_tolerance=tolerance,
+                      hourly_min_import_kW=lower.tolist(), hourly_max_import_kW=upper.tolist(),
+                      hours_crossing_cap=(np.flatnonzero(ambiguous) + 1).tolist())
+        if ambiguous.any():
+            report.update(minimum_exceedance_kWh=None, maximum_exceedance_kWh=None)
+        else:
+            expression = gp.quicksum(imports[t] - float(cap[t])
+                                     for t in range(len(imports)) if above[t])
+            minimum = solve(expression, GRB.MINIMIZE)
+            maximum = solve(expression, GRB.MAXIMIZE)
+            report.update(minimum_exceedance_kWh=max(0.0, minimum),
+                          maximum_exceedance_kWh=max(0.0, maximum))
+        return report
+    finally:
+        model.dispose()

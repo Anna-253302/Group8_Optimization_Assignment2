@@ -1,192 +1,310 @@
-"""Entry point of the Assignment 2 starter package: load a community and summarize it.
+"""Assignment 2: load inputs, run named experiments, analyse and save results.
 
-    Examples:
-    python main.py
-    python main.py --model R
-    python main.py --model I
-    python main.py --model both --day d1
-    python main.py                                   # base case (16 members), day d1
-    python main.py --community my_mix                # your own data/params_community_my_mix.json
-    python main.py --day d4                          # another day of the week (and that day's cap)
-    python main.py --members                         # also print every member's Assignment 1 summary
-    python main.py --demo                            # also run the scenario-generation demonstration (Question 3)
+Examples:
+    python main.py --model all --day d1
+    python main.py --model all --day d1 --settlement
+    python main.py --day d1 --sensitivity both --reference-diagnostics
 
-Models R (Reference), I (Individual DSO Contracts) and C (Community DSO Contract) are implemented.
+R, I and C use the shared parametrized model in src/model.py. Experiment
+configurations and runners stay here, following Assignment 1. Quantities,
+settlement and exports are handled by src/analysis.py; figures by plotting.py.
 """
-
 from __future__ import annotations
 
 import argparse
+import json
+import time
+from functools import partial
 from pathlib import Path
 
-from src.data_loader import load_community, list_communities
-from src.model import solve_community
+import numpy as np
 
+from src.data_loader import load_community, list_communities, with_contract
+from src.model import solve_community, reference_exceedance_range
 from src.analysis import (
     analyse_reference,
     analyse_individual_contracts,
     analyse_centralized_contract,
     validate_reference,
     print_three_model_comparison,
+    analyse_settlement,
+    print_settlement,
+    export_settlement,
+    analyse_contract_sensitivity,
+    export_contract_sensitivity,
 )
-
-from src.plotting import plot_feeder_import
+from src.plotting import plot_feeder_import, plot_settlement, plot_contract_sensitivity
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
+# Named experiments: changing a value does not change the provided input files.
+CONTRACT_STUDIES = {
+    "discount": {
+        "values": [0, .1, .2, .3, .4, .5, .6, .7, .75, .8, .9, 1],
+        "parameter": "discount",
+        "base_attribute": "tariff_discount_ratio",
+    },
+    "cap": {
+        "values": [.8, 1, 1.1, 1.2, 1.3, 1.4, 1.6, 1.8, 2, 2.5, 3, 4, 6, 8],
+        "parameter": "cap_factor",
+        "base_attribute": "capacity_limit_daily_energy_factor",
+    },
+}
+
+
+def run_base_case(
+    community, output_dir, *, model="all", settlement=False,
+    reference_diagnostics=False, verbose=False,
+):
+    """Solve the selected base models and save Q1 figures and settlement tables.
+
+    community is the loaded CommunityData; output_dir is a results directory.
+    model selects R/I/C, both (R+I), all or none. Settlement needs all three
+    benchmarks. Return a dictionary of solved results for reuse; costs are DKK,
+    powers kW and daily energies kWh (one-hour intervals).
+    """
+    selections = {
+        "R": ("R",), "I": ("I",), "C": ("C",),
+        "both": ("R", "I"), "all": ("R", "I", "C"), "none": (),
+    }
+    if model not in selections:
+        raise ValueError(f"Unknown model selection: {model}")
+    if settlement and model != "all":
+        raise ValueError("Settlement requires all three member benchmarks")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results, metrics = {}, {}
+    titles = {"R": "REFERENCE", "I": "INDIVIDUAL CONTRACTS",
+              "C": "CENTRALIZED COMMUNITY CONTRACT"}
+    for kind in selections[model]:
+        print("\n" + "=" * 60)
+        print(f"MODEL {kind} - {titles[kind]}")
+        print("=" * 60)
+        result = solve_community(community, model_type=kind, verbose=verbose)
+        results[kind] = result
+        if kind == "R":
+            metric = analyse_reference(community, result)
+            diagnostic = None
+            if reference_diagnostics:
+                diagnostic = reference_exceedance_range(community)
+                (output_dir / "reference_exceedance_diagnostic.json").write_text(
+                    json.dumps(diagnostic, indent=2, allow_nan=False) + "\n",
+                    encoding="utf-8")
+            validate_reference(community, metric, exceedance_range=diagnostic)
+            print(f"Total objective: {metric.total_objective_DKK:.2f} DKK")
+            print(f"Daily gross import: {metric.daily_import_kWh:.2f} kWh")
+            print(f"Peak feeder import: {metric.peak_import_kW:.2f} kW")
+        elif kind == "I":
+            metric = analyse_individual_contracts(community, result)
+            print(f"Total objective: {metric.feeder.total_objective_DKK:.2f} DKK")
+            print(f"Daily gross import: {metric.feeder.daily_import_kWh:.2f} kWh")
+            print(f"Peak feeder import: {metric.feeder.peak_import_kW:.2f} kW")
+            print(f"Individual exceedance: {metric.individual_exceedance_kWh:.2f} kWh")
+            print(f"Individual penalties: {metric.individual_penalty_DKK:.2f} DKK")
+        else:
+            metric = analyse_centralized_contract(community, result)
+            print(f"Total objective: {result.objective_DKK:.2f} DKK")
+            print(f"Daily community import: {sum(result.community_import_kW):.2f} kWh")
+            print(f"Daily community export: {sum(result.community_export_kW):.2f} kWh")
+            print(f"Peak community import: {max(result.community_import_kW):.2f} kW")
+            print(f"Community exceedance: {sum(result.community_exceedance_kW):.2f} kWh")
+            print(f"Congested hours: {sum(result.community_exceedance_kW > 1e-6)}")
+        metrics[kind] = metric
+    if all(kind in metrics for kind in ("R", "I", "C")):
+        print_three_model_comparison(metrics["R"], metrics["I"], metrics["C"])
+    if settlement:
+        payments = analyse_settlement(community, results["R"], results["I"], results["C"])
+        print_settlement(payments)
+        export_settlement(payments, output_dir)
+        plot_settlement(payments, output_dir)
+    if results:
+        plot_feeder_import(community, results, output_dir)
+        print(f"\nFigure saved to: {output_dir}")
+    return results
+
+
+def refine_crossings(points, evaluate, tolerance=.005):
+    """Bracket zeroes of savings vs R, refining only observed sign changes.
+
+    points maps parameter values to signed savings in DKK. evaluate(value)
+    solves/evaluates another point. Returned brackets are sampled thresholds,
+    not interpolated exact break-even values or claims outside the study range.
+    """
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("Refinement tolerance must be finite and positive")
+    ordered = sorted(points)
+    brackets = []
+    for low, high in zip(ordered, ordered[1:]):
+        gl, gh = float(points[low]), float(points[high])
+        if gl * gh >= 0:
+            continue
+        for _ in range(40):
+            if high - low <= tolerance:
+                break
+            mid = float((low + high) / 2)
+            gm = float(evaluate(mid))
+            if not np.isfinite(gm):
+                raise ValueError("Nonfinite savings during threshold refinement")
+            if gm == 0:
+                low = high = mid
+                gl = gh = 0.0
+                break
+            if gl * gm < 0:
+                high, gh = mid, gm
+            else:
+                low, gl = mid, gm
+        brackets.append(dict(lower=low, upper=high,
+                             savings_at_lower_DKK=gl, savings_at_upper_DKK=gh))
+    return brackets
+
+
+def run_contract_sensitivity(
+    community, output_dir, *, dimensions=("discount", "cap"), discounts=None,
+    cap_factors=None, refine=True, solver=solve_community, reference_diagnostics=False,
+):
+    """Solve R once, then I and C per contract; export metrics and settlement.
+
+    Discount and cap studies each start from an untouched copy of the base case.
+    Values near observed aggregate break-even points are refined to brackets of
+    width <= .005 in beta or f. Per-member IR counts describe returned LP duals.
+    solver is injectable for independent verification of the same model matrix.
+    """
+
+    dimensions = tuple(dimensions)
+    if not dimensions or any(d not in ("discount", "cap") for d in dimensions):
+        raise ValueError("Study dimensions must be discount and/or cap")
+    values_by_dimension = {
+        "discount": list(CONTRACT_STUDIES["discount"]["values"] if discounts is None else discounts),
+        "cap": list(CONTRACT_STUDIES["cap"]["values"] if cap_factors is None else cap_factors),
+    }
+    # Validate every requested value before starting any optimization.
+    for dimension in dimensions:
+        if len(values_by_dimension[dimension]) < 2:
+            raise ValueError("Each study needs at least two parameter values")
+        for value in values_by_dimension[dimension]:
+            with_contract(community, **{CONTRACT_STUDIES[dimension]["parameter"]: value})
+    started = time.perf_counter()
+    reference = solver(community, model_type="R")
+    reference_metrics = analyse_reference(community, reference)
+    diagnostic = None
+    if reference_diagnostics:
+        diagnostic = reference_exceedance_range(community)
+    reference_checks = validate_reference(community, reference_metrics, exceedance_range=diagnostic)
+    if any(not passed for key, passed in reference_checks.items() if key != "exceedance_kWh"):
+        raise ValueError("Primary R benchmark checks failed; investigate before the sensitivity study")
+
+    output_dir = Path(output_dir)
+    reports = {}
+    for dimension in dimensions:
+        folder = output_dir / dimension
+        folder.mkdir(parents=True, exist_ok=True)
+        study = CONTRACT_STUDIES[dimension]
+        base_value = getattr(community.contract, study["base_attribute"])
+        coarse_values = sorted(set(float(x) for x in values_by_dimension[dimension]) | {float(base_value)})
+        cache = {}
+
+        def evaluate(value):
+            value = float(value)
+            if value not in cache:
+                case = with_contract(community, **{
+                    study["parameter"]: value})
+                point_start = time.perf_counter()
+                individual = solver(case, model_type="I")
+                centralized = solver(case, model_type="C")
+                settlement = analyse_settlement(case, reference, individual, centralized)
+                rows = analyse_contract_sensitivity(case, reference, individual, centralized, settlement, dimension, value)
+                if rows[2]["total_objective_DKK"] > rows[1]["total_objective_DKK"] + 1e-5:
+                    raise ValueError("C costs more than I under the same contract")
+                cache[value] = (rows, settlement, time.perf_counter() - point_start)
+                print(f"{dimension}={value:.5f}: I={rows[1]['total_objective_DKK']:.2f}, "
+                      f"C={rows[2]['total_objective_DKK']:.2f} DKK; "
+                      f"C members not worse off vs R={rows[2]['members_not_worse_off_vs_R']}/{len(case.members)}")
+            return cache[value]
+
+        for value in coarse_values:
+            evaluate(value)
+        thresholds = {}
+        for kind, index in (("I", 1), ("C", 2)):
+            gains = {value: cache[value][0][index]["savings_vs_R_DKK"] for value in coarse_values}
+            brackets = (refine_crossings(gains, lambda value, j=index:
+                        evaluate(value)[0][j]["savings_vs_R_DKK"]) if refine else [])
+            thresholds[kind] = dict(
+                break_even_brackets=brackets,
+                sampled_zero_savings=[v for v, g in gains.items() if abs(g) <= 1e-5],
+                minimum_coarse_savings_DKK=min(gains.values()),
+                maximum_coarse_savings_DKK=max(gains.values()))
+        rows = [row for value in sorted(cache) for row in cache[value][0]]
+        for index, kind in ((1, "I"), (2, "C")):
+            costs = [cache[value][0][index]["total_objective_DKK"] for value in sorted(cache)]
+            if np.any(np.diff(costs) > 1e-5):
+                raise ValueError(f"{kind} cost increased as {dimension} increased")
+        members = [dict(dimension=dimension, parameter_value=value, **member)
+                   for value in sorted(cache) for member in cache[value][1].members]
+        report = dict(
+            community=community.community, day=community.day, dimension=dimension,
+            base_value=base_value, coarse_values=coarse_values, evaluated_values=sorted(cache),
+            thresholds_against_R=thresholds, reference_checks=reference_checks,
+            reference_exceedance_diagnostic=diagnostic,
+            fixed_penalty_DKK_per_kWh=community.contract.penalty_DKK_per_kWh,
+            fixed_discount=community.contract.tariff_discount_ratio if dimension == "cap" else None,
+            fixed_cap_factor=community.contract.capacity_limit_daily_energy_factor if dimension == "discount" else None,
+            hypothesis="I/C optimal costs cannot increase with more discount or more cap; R is fixed. C <= I. Individual gains need not be monotone.",
+            units="One-hour intervals; costs DKK/day; powers kW; exceedances kWh/day",
+            metering_note="R/I aggregate own-meter gross imports; C uses the shared meter. Individual contractual exceedance is separate from aggregate exceedance. Net feeder diagnostics use positive aggregate net exchange.",
+            interpretation_note="No surplus redistribution. Counts refer to returned optimal dispatch/duals and do not prove uniqueness or feasibility under all optimal prices. A break-even bracket concerns aggregate dispatch cost, not every member's participation.",
+            elapsed_seconds_by_value={str(value): cache[value][2] for value in sorted(cache)},
+            validation_passed=True)
+        export_contract_sensitivity(rows, members, report, folder)
+        plot_contract_sensitivity(rows, folder, dimension, base_value, len(community.members), thresholds)
+        reports[dimension] = report
+    print(f"Sensitivity results saved to {output_dir} ({time.perf_counter() - started:.1f} s)")
+    return reports
+
 
 def main() -> None:
+    """Parse the experiment options and run the selected reproducible command."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--community", default="base", help=f"base (shipped) or your own params_community_<name>.json; available: {list_communities()}")
+    ap.add_argument("--community", default="base",
+                    help=f"base or your own community; available: {list_communities()}")
     ap.add_argument("--day", default="d1", help="d1 (base case) ... d7")
-    ap.add_argument("--members", action="store_true", help="print the Assignment 1 summary of every member")
-    ap.add_argument("--demo", action="store_true", help="run the scenario-generation demonstration")
-    ap.add_argument("--model", choices=["R", "I", "C", "both", "all", "none"], default="all", help="Select optimization model: R, I, C, both (R+I), all, or none",)
-    ap.add_argument("--verbose-solver", action="store_true", help="Show Gurobi solver output",)
+    ap.add_argument("--members", action="store_true", help="Print every member's input summary")
+    ap.add_argument("--demo", action="store_true", help="Run the Question 3 scenario demonstration")
+    ap.add_argument("--model", choices=["R", "I", "C", "both", "all", "none"], default="all",
+                    help="R, I, C, both (R+I), all, or none")
+    ap.add_argument("--verbose-solver", action="store_true", help="Show Gurobi solver output")
+    ap.add_argument("--settlement", action="store_true",
+                    help="Calculate member benefits and manager budget (requires --model all)")
+    ap.add_argument("--sensitivity", choices=["discount", "cap", "both"],
+                    help="Run Q1 contract studies (requires --model all)")
+    ap.add_argument("--discount-values", nargs="+", type=float,
+                    help="Coarse beta values; base beta is always included")
+    ap.add_argument("--cap-factors", nargs="+", type=float,
+                    help="Coarse absolute cap-energy factors f; base f is always included")
+    ap.add_argument("--no-refine", action="store_true", help="Skip break-even refinement")
+    ap.add_argument("--reference-diagnostics", action="store_true",
+                    help="Certify R's exceedance range across alternative economic optima")
     args = ap.parse_args()
-
-    com = load_community(args.community, day=args.day)
-    print(com.summary(), "\n")
+    if (args.settlement or args.sensitivity) and args.model != "all":
+        ap.error("--settlement/--sensitivity requires --model all to calculate both member benchmarks")
+    if (args.discount_values or args.cap_factors or args.no_refine) and not args.sensitivity:
+        ap.error("Sweep values and --no-refine require --sensitivity")
+    community = load_community(args.community, day=args.day)
+    output_dir = RESULTS_DIR / args.community / args.day
+    print(community.summary(), "\n")
+    if args.sensitivity:
+        dimensions = ("discount", "cap") if args.sensitivity == "both" else (args.sensitivity,)
+        run_contract_sensitivity(
+            community, output_dir / "sensitivity", dimensions=dimensions,
+            discounts=args.discount_values, cap_factors=args.cap_factors,
+            refine=not args.no_refine,
+            solver=partial(solve_community, verbose=args.verbose_solver),
+            reference_diagnostics=args.reference_diagnostics)
+        return
     if args.members:
-        for m in com.members:
-            print(m.summary(), "\n")
-    print("Cap profile (kW):", " ".join(f"{x:.1f}" for x in com.contract.capacity_limit_kW))
-    ic = com.contract.individual_capacity_limit_kW
-    print("Individual caps in model I (kW), hour 0 / hour 11:",
-          "  ".join(f"{cid} ({com.member(cid).archetype}) {ic[cid][0]:.2f}/{ic[cid][11]:.2f}" for cid in ("C1", "C1_PVB", "C4", "C4_PVB") if cid in com.member_ids))
-    (RESULTS_DIR / args.community).mkdir(parents=True, exist_ok=True)
-    
-        # ==========================================================
-    # QUESTION 1: OPTIMIZATION MODELS R, I AND C
-    # ==========================================================
-
-    metrics_R = None
-    metrics_I = None
-    metrics_C = None
-    results_C = None
-
-    plot_results = {}
-
-    # ----------------------------------------------------------
-    # MODEL R - Reference
-    # ----------------------------------------------------------
-
-    if args.model in ("R", "both", "all"):
-
-        print("\n" + "=" * 60)
-        print("MODEL R - REFERENCE")
-        print("=" * 60)
-
-        results_R = solve_community(
-            com,
-            model_type="R",
-            verbose=args.verbose_solver,
-        )
-
-        metrics_R = analyse_reference(
-            com,
-            results_R,
-        )
-
-        validate_reference(
-            com,
-            metrics_R,
-        )
-
-        print(f"Total objective: {metrics_R.total_objective_DKK:.2f} DKK")
-        print(f"Daily gross import: {metrics_R.daily_import_kWh:.2f} kWh")
-        print(f"Peak feeder import: {metrics_R.peak_import_kW:.2f} kW")
-
-        plot_results["R"] = results_R
-
-    # ----------------------------------------------------------
-    # MODEL I - Individual contracts
-    # ----------------------------------------------------------
-
-    if args.model in ("I", "both", "all"):
-
-        print("\n" + "=" * 60)
-        print("MODEL I - INDIVIDUAL CONTRACTS")
-        print("=" * 60)
-
-        results_I = solve_community(
-            com,
-            model_type="I",
-            verbose=args.verbose_solver,
-        )
-
-        metrics_I = analyse_individual_contracts(
-            com,
-            results_I,
-        )
-
-        print(f"Total objective: {metrics_I.feeder.total_objective_DKK:.2f} DKK")
-        print(f"Daily gross import: {metrics_I.feeder.daily_import_kWh:.2f} kWh")
-        print(f"Peak feeder import: {metrics_I.feeder.peak_import_kW:.2f} kW")
-        print(f"Individual exceedance: {metrics_I.individual_exceedance_kWh:.2f} kWh")
-        print(f"Individual penalties: {metrics_I.individual_penalty_DKK:.2f} DKK")
-
-        plot_results["I"] = results_I
-
-    # ----------------------------------------------------------
-    # MODEL C - Centralized community contract
-    # ----------------------------------------------------------
-
-    if args.model in ("C", "all"):
-
-        print("\n" + "=" * 60)
-        print("MODEL C - CENTRALIZED COMMUNITY CONTRACT")
-        print("=" * 60)
-
-        results_C = solve_community(com,model_type="C",verbose=args.verbose_solver,)
-        
-        metrics_C = analyse_centralized_contract(com, results_C,)
-
-        community_import = results_C.community_import_kW
-        community_export = results_C.community_export_kW
-        community_exceedance = results_C.community_exceedance_kW
-
-        print(f"Total objective: {results_C.objective_DKK:.2f} DKK")
-        print(f"Daily community import: {sum(community_import):.2f} kWh")
-        print(f"Daily community export: {sum(community_export):.2f} kWh")
-        print(f"Peak community import: {max(community_import):.2f} kW")
-        print(f"Community exceedance: {sum(community_exceedance):.2f} kWh")
-        print(f"Congested hours: {sum(community_exceedance > 1e-6)}")
-
-        plot_results["C"] = results_C
-
-        # ----------------------------------------------------------
-    # MODEL COMPARISON: R vs I vs C
-    # ----------------------------------------------------------
-
-    if (
-        metrics_R is not None
-        and metrics_I is not None
-        and metrics_C is not None
-    ):
-
-        print_three_model_comparison(
-            metrics_R,
-            metrics_I,
-            metrics_C,
-        )
-        
-    # ----------------------------------------------------------
-    # FIGURE 1 - HOURLY FEEDER IMPORT
-    # ----------------------------------------------------------
-
-    if plot_results:
-
-        output_dir = RESULTS_DIR / args.community / args.day
-
-        plot_feeder_import(
-            com,
-            plot_results,
-            output_dir,
-        )
-
-        print(f"\nFigure saved to: {output_dir}")
-
+        for member in community.members:
+            print(member.summary(), "\n")
+    run_base_case(community, output_dir, model=args.model, settlement=args.settlement,
+                  reference_diagnostics=args.reference_diagnostics, verbose=args.verbose_solver)
     if args.demo:
         import runpy
         runpy.run_module("src.scenario_generation", run_name="__main__")
