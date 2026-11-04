@@ -912,6 +912,8 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
         raise ValueError('Community must have unique, nonempty member IDs')
     if centralized.model_type != 'C' or dp.model_type != 'DP':
         raise ValueError('DP analysis requires Model C and Model DP results')
+    if dp.individual_rationality and not dp.budget_balance:
+        raise ValueError('Individual rationality requires Budget Balance')
     if centralized.solver_status not in (None, GRB.OPTIMAL):
         raise ValueError('The centralized benchmark must be optimal')
     n = community.members[0].n_hours
@@ -1017,6 +1019,8 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
               f'{cid} settled member cost reconstruction')
         gain_r = float(reference[cid].objective_DKK - settled)
         gain_i = float(individual[cid].objective_DKK - settled)
+        if dp.individual_rationality and gain_r < -tolerance:
+            raise ValueError(f'DP + BB + IR validation failed: {cid} is worse off than Model R')
         members.append(dict(
             consumer_id=cid, archetype=member.archetype, slope_class=member.slope_class,
             has_pv=bool(member.has_pv), has_battery=bool(member.has_battery),
@@ -1057,7 +1061,8 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
     difference = internal - c_price
     summary = dict(
         community=community.community, day=community.day,
-        model_variant='DP_budget_balance' if dp.budget_balance else 'DP_cap_only',
+        model_variant=('DP_budget_balance_ir' if dp.individual_rationality else
+                       'DP_budget_balance' if dp.budget_balance else 'DP_cap_only'),
         dt_hours=1.0, tolerance=tolerance, relative_tolerance=0.0,
         units=dict(costs='DKK/day', prices='DKK/kWh', power='kW', energy='kWh/day', mip_gap='fraction'),
         objectives_DKK=objectives, efficiency_loss_DKK=efficiency_loss,
@@ -1082,6 +1087,10 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
     if dp.budget_balance:
         summary.update(budget_balance_enforced=True, budget_balance_validation_passed=True,
                        interpretation_note='Optimistic follower responses may be nonunique. Equal community costs do not imply equal prices or schedules. BB is enforced; IR remains diagnostic. No surplus is redistributed.')
+    if dp.individual_rationality:
+        summary.update(individual_rationality_enforced=True, individual_rationality_validation_passed=True,
+                       worse_off_vs_R_count=len(summary['worse_off_vs_R']),
+                       interpretation_note='Optimistic follower responses may be nonunique. Equal community costs do not imply equal prices or schedules. BB and IR against Model R are enforced. No surplus is redistributed.')
     hourly = [dict(
         hour=t + 1, day_ahead_price_DKK_per_kWh=float(price[t]),
         discounted_import_price_DKK_per_kWh=float(buy[t]),
@@ -1105,7 +1114,7 @@ def export_dp_analysis(analysis, output_dir):
     content = json.dumps(payload, indent=2, allow_nan=False) + '\n'
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = 'budget_balance.json' if analysis.summary['model_variant'] == 'DP_budget_balance' else 'cap_only.json'
+    filename = analysis.summary['model_variant'].removeprefix('DP_') + '.json'
     output_path = output_dir / filename
     output_path.write_text(content, encoding='utf-8')
     return output_path

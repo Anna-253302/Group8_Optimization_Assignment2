@@ -44,10 +44,15 @@ def get_model_configuration(
     model_type: str,
     *,
     budget_balance: bool = False,
+    individual_rationality: bool = False,
 ) -> ModelConfiguration:
     """Return the configuration corresponding to the selected model."""
     if budget_balance and model_type != 'DP':
         raise ValueError('Budget balance is only supported for Model DP')
+    if individual_rationality and model_type != 'DP':
+        raise ValueError('Individual rationality is only supported for Model DP')
+    if individual_rationality and not budget_balance:
+        raise ValueError('Individual rationality requires Budget Balance')
 
     beta = float(community.contract.tariff_discount_ratio)
 
@@ -76,6 +81,7 @@ def get_model_configuration(
             metering="community",
             capacity_contract="community",
             budget_balance=budget_balance,
+            individual_rationality=individual_rationality,
         ),
     }
 
@@ -292,6 +298,7 @@ class CommunityResult:
     mip_gap: float | None = None
     solver_status: int | None = None
     budget_balance: bool = False
+    individual_rationality: bool = False
 
 
 # ==========================================================
@@ -305,6 +312,8 @@ def solve_community(
     terminal_soc: str = "cyclic",
     verbose: bool = False,
     budget_balance: bool = False,
+    individual_rationality: bool = False,
+    reference_costs_DKK: dict[str, float] | None = None,
 ):
     """
     Solve the selected community optimization configuration.
@@ -321,6 +330,8 @@ def solve_community(
         terminal_soc=terminal_soc,
         verbose=verbose,
         budget_balance=budget_balance,
+        individual_rationality=individual_rationality,
+        reference_costs_DKK=reference_costs_DKK,
     )
 
     optimization.build()
@@ -577,9 +588,12 @@ class CommunityModel:
     """Shared physical LP for R/I/C; DP adds prices and follower KKT conditions."""
 
     def __init__(self, community: CommunityData, model_type: Literal['R', 'I', 'C', 'DP'] = 'R',
-                 terminal_soc: str = 'cyclic', verbose: bool = False, *, budget_balance: bool = False):
+                 terminal_soc: str = 'cyclic', verbose: bool = False, *, budget_balance: bool = False,
+                 individual_rationality: bool = False, reference_costs_DKK: dict[str, float] | None = None):
         self.community = community
-        self.config = get_model_configuration(community, model_type, budget_balance=budget_balance)
+        self.config = get_model_configuration(community, model_type, budget_balance=budget_balance,
+                                              individual_rationality=individual_rationality)
+        self.reference_costs_DKK = reference_costs_DKK
         self.terminal_soc = terminal_soc
         self.model = gp.Model(f'Community_{model_type}')
         self.model.Params.OutputFlag = int(verbose)
@@ -613,6 +627,8 @@ class CommunityModel:
         if self.config.model_type == 'DP' and self.config.budget_balance:
             self._enforce_exact_bb_accounting()
             self._build_budget_balance()
+        if self.config.model_type == 'DP' and self.config.individual_rationality:
+            self._build_individual_rationality()
         return self
 
     def _build_consumers(self):
@@ -770,6 +786,19 @@ class CommunityModel:
         external = self.objective_components['procurement'] + self.objective_components['penalty']
         self.model.addConstr(payments == external, name='budget_balance')
 
+    def _build_individual_rationality(self):
+        """Bound each follower's optimal total cost by its fixed Model R cost."""
+        if self.reference_costs_DKK is None:
+            raise ValueError('Individual Rationality requires Model R reference costs')
+        if set(self.reference_costs_DKK) != set(self.blocks):
+            raise ValueError('Reference costs must match all community members')
+        for cid in self.blocks:
+            reference_cost = float(self.reference_costs_DKK[cid])
+            if not np.isfinite(reference_cost):
+                raise ValueError(f'Invalid Model R reference cost for {cid}')
+            self.model.addConstr(self.follower_dual_objectives[cid] <= reference_cost,
+                                 name=f'individual_rationality_{cid}')
+
     def solve(self):
         self.model.optimize()
         if self.model.Status != GRB.OPTIMAL:
@@ -779,6 +808,8 @@ class CommunityModel:
                           GRB.INF_OR_UNBD: 'INF_OR_UNBD', GRB.UNBOUNDED: 'UNBOUNDED'}.get(
                               self.model.Status, 'solver stopped')
                 variant = 'DP + BB' if self.config.budget_balance else self.config.model_type
+                if self.config.individual_rationality:
+                    variant += ' + IR'
                 raise RuntimeError(
                     f'Model {variant}: {status} (Gurobi status {self.model.Status}){detail}')
             warnings.warn(
@@ -839,7 +870,8 @@ class CommunityModel:
                                if self.config.model_type == 'C' else None),
                 internal_prices=prices,
                 mip_gap=float(self.model.MIPGap) if self.config.model_type == 'DP' else None,
-                solver_status=int(self.model.Status), budget_balance=self.config.budget_balance)
+                solver_status=int(self.model.Status), budget_balance=self.config.budget_balance,
+                individual_rationality=self.config.individual_rationality)
         total = sum(r.objective_DKK for r in results.values())
         if not np.isclose(total, self.model.ObjVal, atol=1e-5):
             raise RuntimeError(f'Member costs ({total}) differ from model objective ({self.model.ObjVal})')
