@@ -1,4 +1,4 @@
-"""Post-processing and validation for Assignment 2, Question 1.
+"""Post-processing and validation for Assignment 2, Questions 1 and 2.
 
 Reference R and individual-contract I have *individual meters*: gross feeder
 import is the SUM of individual imports, not the positive part of net trade.
@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 import numpy as np
+from gurobipy import GRB
 
 from .data_loader import CommunityData
 from .model import ReferenceResult, CommunityResult
@@ -888,6 +889,215 @@ def export_settlement(result: SettlementResult, output_dir: Path) -> None:
     (output_dir / "settlement_summary.json").write_text(
         json.dumps(result.summary, indent=2, allow_nan=False) + "\n",
         encoding="utf-8")
+
+
+# ==========================================================
+# QUESTION 2: DYNAMIC PRICING, CAP ONLY
+# ==========================================================
+
+def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1e-5):
+    """Analyse DP's shared meter, internal transfers and member participation.
+
+    All intervals are one hour. Checks use absolute tolerance (rtol=0), in
+    DKK for accounting and kW/kWh for physical quantities. Return the existing
+    SettlementResult container, with DP-specific records; no C cap-rent identity
+    is imposed. Prices and schedules need not equal C's, even at equal welfare.
+    Optimistic LP responses may be nonunique; schedule differences alone do not
+    establish a particular consumer's indifference.
+    """
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError('tolerance must be finite and positive')
+    ids = community.member_ids
+    if not ids or len(ids) != len(set(ids)):
+        raise ValueError('Community must have unique, nonempty member IDs')
+    if centralized.model_type != 'C' or dp.model_type != 'DP':
+        raise ValueError('DP analysis requires Model C and Model DP results')
+    if centralized.solver_status not in (None, GRB.OPTIMAL):
+        raise ValueError('The centralized benchmark must be optimal')
+    n = community.members[0].n_hours
+    if any(member.n_hours != n for member in community.members):
+        raise ValueError('All members must have the same horizon')
+    for kind, results in (('R', reference), ('I', individual),
+                          ('C', centralized.member_results), ('DP', dp.member_results)):
+        if set(results) != set(ids) or any(results[cid].consumer_id != cid for cid in ids):
+            raise ValueError(f'{kind}: result IDs do not match community members')
+
+    def array(value, label):
+        a = np.asarray(value, dtype=float)
+        if a.shape != (n,) or not np.all(np.isfinite(a)):
+            raise ValueError(f'{label}: expected {n} finite hourly values')
+        return a
+
+    def scalar(value, label):
+        value = float(value)
+        if not np.isfinite(value):
+            raise ValueError(f'{label}: expected a finite value')
+        return value
+
+    def check(actual, expected, label):
+        if not np.allclose(actual, expected, atol=tolerance, rtol=0):
+            raise ValueError(f'DP validation failed: {label}')
+
+    price = array(community.energy_price, 'day-ahead price')
+    internal = array(dp.internal_prices, 'DP internal price')
+    c_price = array(centralized.balance_duals, 'C balance dual price')  # Pi, no sign flip.
+    cap = array(community.contract.capacity_limit_kW, 'DSO capacity limit')
+    if np.any(cap < 0):
+        raise ValueError('DSO capacity limit must be nonnegative')
+    discount = 1 - scalar(community.contract.tariff_discount_ratio, 'tariff discount')
+    alpha = scalar(community.contract.penalty_DKK_per_kWh, 'penalty')
+    buy = price + discount * community.import_tariff
+    sell = price - discount * community.export_tariff
+    if np.any(internal < sell - tolerance) or np.any(internal > buy + alpha + tolerance):
+        raise ValueError('DP internal prices violate Cap-Only price bounds')
+    objectives = {
+        'R': sum(scalar(reference[cid].objective_DKK, f'R/{cid} cost') for cid in ids),
+        'I': sum(scalar(individual[cid].objective_DKK, f'I/{cid} cost') for cid in ids),
+        'C': scalar(centralized.objective_DKK, 'C objective'),
+        'DP': scalar(dp.objective_DKK, 'DP objective'),
+    }
+    efficiency_loss = objectives['DP'] - objectives['C']
+    if efficiency_loss < -tolerance:
+        raise ValueError('DP validation failed: DP costs less than the optimal C benchmark')
+
+    # Reconstruct both community objectives with the same external tariff rule.
+    costs, meters, local_costs = {}, {}, {}
+    for kind, result in (('C', centralized), ('DP', dp)):
+        imp = array(result.community_import_kW, f'{kind} import')
+        exp = array(result.community_export_kW, f'{kind} export')
+        if np.any(imp < -tolerance) or np.any(exp < -tolerance):
+            raise ValueError(f'{kind}: community import and export must be nonnegative')
+        excess = np.maximum(imp - cap, 0.0)
+        check(array(result.community_exceedance_kW, f'{kind} exceedance'), excess,
+              f'{kind} community exceedance')
+        energy = price * (imp - exp)
+        tariffs = discount * (community.import_tariff * imp + community.export_tariff * exp)
+        penalty = alpha * excess
+        external = energy + tariffs + penalty
+        meters[kind] = dict(imp=imp, exp=exp, excess=excess, external=external)
+        local_costs[kind] = {}
+        aggregate_net = np.zeros(n)
+        for member in community.members:
+            cid = member.consumer_id
+            own = result.member_results[cid]
+            pv = array(own.pv_kW, f'{kind}/{cid} PV')
+            deviation = array(own.deviation_kW, f'{kind}/{cid} deviation')
+            load = array(own.load_kW, f'{kind}/{cid} load')
+            net = array(own.net_exchange_kW, f'{kind}/{cid} net exchange')
+            charge = np.zeros(n) if own.charge_kW is None else array(own.charge_kW, 'charge')
+            discharge = (np.zeros(n) if own.discharge_kW is None
+                         else array(own.discharge_kW, 'discharge'))
+            check(net, load + charge - pv - discharge, f'{kind}/{cid} physical exchange')
+            check(deviation, np.abs(load - member.reference_load),
+                  f'{kind}/{cid} absolute deviation')
+            local_costs[kind][cid] = (
+                scalar(member.pv_marginal_cost * pv.sum(), f'{kind}/{cid} PV cost'),
+                scalar(member.linear_disutility * deviation.sum(), f'{kind}/{cid} disutility'))
+            aggregate_net += net
+        check(aggregate_net, imp - exp, f'{kind} community power balance')
+        costs[kind] = dict(
+            energy_market_DKK=float(energy.sum()), grid_tariffs_DKK=float(tariffs.sum()),
+            penalty_DKK=float(penalty.sum()),
+            pv_generation_DKK=sum(v[0] for v in local_costs[kind].values()),
+            disutility_DKK=sum(v[1] for v in local_costs[kind].values()))
+        reconstructed = sum(costs[kind].values())
+        check(reconstructed, objectives[kind], f'{kind} objective reconstruction')
+        costs[kind]['total_objective_DKK'] = reconstructed
+
+    members = []
+    hourly_payments = np.zeros(n)
+    for member in community.members:
+        cid = member.consumer_id
+        own = dp.member_results[cid]
+        payments = internal * own.net_exchange_kW
+        payment = float(payments.sum())
+        pv_cost, disutility = local_costs['DP'][cid]
+        settled = payment + pv_cost + disutility
+        check(settled, scalar(own.objective_DKK, f'DP/{cid} cost'),
+              f'{cid} settled member cost reconstruction')
+        gain_r = float(reference[cid].objective_DKK - settled)
+        gain_i = float(individual[cid].objective_DKK - settled)
+        members.append(dict(
+            consumer_id=cid, archetype=member.archetype, slope_class=member.slope_class,
+            has_pv=bool(member.has_pv), has_battery=bool(member.has_battery),
+            reference_cost_DKK=float(reference[cid].objective_DKK),
+            individual_cost_DKK=float(individual[cid].objective_DKK),
+            payment_DP_DKK=payment, pv_generation_DP_DKK=pv_cost,
+            disutility_DP_DKK=disutility, settled_cost_DP_DKK=settled,
+            gain_vs_R_DKK=gain_r, gain_vs_I_DKK=gain_i,
+            individually_rational_vs_R=bool(gain_r >= -tolerance),
+            individually_rational_vs_I=bool(gain_i >= -tolerance),
+            net_energy_DP_kWh=float(np.sum(own.net_exchange_kW))))
+        hourly_payments += payments
+
+    imp, exp = meters['DP']['imp'], meters['DP']['exp']
+    excess, external = meters['DP']['excess'], meters['DP']['external']
+    aggregate_net = np.sum([dp.member_results[cid].net_exchange_kW for cid in ids], axis=0)
+    check(hourly_payments, internal * aggregate_net, 'hourly payment aggregation')
+    total_payments = float(hourly_payments.sum())
+    check(total_payments, sum(row['payment_DP_DKK'] for row in members), 'daily payment aggregation')
+    external_bill = float(external.sum())
+    surplus = total_payments - external_bill
+    total_settled = sum(row['settled_cost_DP_DKK'] for row in members)
+    residual = float(total_settled - objectives['DP'] - surplus)
+    check(residual, 0.0, 'sum(member costs) = DP objective + manager surplus')
+    status = int(dp.solver_status) if dp.solver_status is not None else None
+    status_names = {GRB.OPTIMAL: 'OPTIMAL', GRB.TIME_LIMIT: 'TIME_LIMIT',
+                    GRB.SUBOPTIMAL: 'SUBOPTIMAL', GRB.INTERRUPTED: 'INTERRUPTED',
+                    GRB.NODE_LIMIT: 'NODE_LIMIT', GRB.SOLUTION_LIMIT: 'SOLUTION_LIMIT'}
+    gap = float(dp.mip_gap) if dp.mip_gap is not None else None
+    if gap is not None and not np.isfinite(gap):
+        gap = None  # Unavailable/infinite solver gaps are represented by JSON null.
+    if gap is not None and gap < 0:
+        raise ValueError('MIP gap must be nonnegative')
+    difference = internal - c_price
+    summary = dict(
+        community=community.community, day=community.day, model_variant='DP_cap_only',
+        dt_hours=1.0, tolerance=tolerance, relative_tolerance=0.0,
+        units=dict(costs='DKK/day', prices='DKK/kWh', power='kW', energy='kWh/day', mip_gap='fraction'),
+        objectives_DKK=objectives, efficiency_loss_DKK=efficiency_loss,
+        objectives_equal_within_tolerance=bool(abs(efficiency_loss) <= tolerance),
+        daily_import_kWh=float(imp.sum()), daily_export_kWh=float(exp.sum()),
+        peak_import_kW=float(imp.max()), exceedance_kWh=float(excess.sum()),
+        congested_hours=int(np.count_nonzero(excess > tolerance)),
+        solver_status=status, solver_status_name=status_names.get(status, 'UNKNOWN' if status is None else f'STATUS_{status}'),
+        mip_gap=gap, dp_proven_optimal=bool(status == GRB.OPTIMAL),
+        max_absolute_price_difference_DKK_per_kWh=float(np.abs(difference).max()),
+        mean_absolute_price_difference_DKK_per_kWh=float(np.abs(difference).mean()),
+        total_payments_DKK=total_payments, external_bill_DKK=external_bill,
+        external_energy_DKK=costs['DP']['energy_market_DKK'],
+        external_tariffs_DKK=costs['DP']['grid_tariffs_DKK'],
+        external_penalty_DKK=costs['DP']['penalty_DKK'],
+        manager_surplus_DKK=surplus, manager_budget_balanced=bool(abs(surplus) <= tolerance),
+        total_settled_member_cost_DKK=total_settled,
+        worse_off_vs_R=[row['consumer_id'] for row in members if not row['individually_rational_vs_R']],
+        worse_off_vs_I=[row['consumer_id'] for row in members if not row['individually_rational_vs_I']],
+        accounting_identity_residual_DKK=residual, validation_passed=True,
+        interpretation_note='Optimistic follower responses may be nonunique. Equal community costs do not imply equal prices or schedules. BB and IR are diagnostics only; no surplus is redistributed.')
+    hourly = [dict(
+        hour=t + 1, day_ahead_price_DKK_per_kWh=float(price[t]),
+        discounted_import_price_DKK_per_kWh=float(buy[t]),
+        discounted_export_price_DKK_per_kWh=float(sell[t]),
+        c_dual_price_DKK_per_kWh=float(c_price[t]),
+        dp_internal_price_DKK_per_kWh=float(internal[t]),
+        dp_minus_c_price_DKK_per_kWh=float(difference[t]),
+        dp_import_kW=float(imp[t]), dp_export_kW=float(exp[t]),
+        c_import_kW=float(meters['C']['imp'][t]), c_export_kW=float(meters['C']['exp'][t]),
+        cap_kW=float(cap[t]), dp_exceedance_kW=float(excess[t]),
+        member_net_exchange_kW=float(aggregate_net[t]),
+        payments_collected_DKK=float(hourly_payments[t]), external_bill_DKK=float(external[t]),
+        manager_surplus_DKK=float(hourly_payments[t] - external[t])) for t in range(n)]
+    return SettlementResult(members, hourly, costs, summary)
+
+
+def export_dp_analysis(analysis, output_dir):
+    """Write all validated DP results to one strict JSON file in the DP directory."""
+    payload = dict(summary=dict(analysis.summary, cost_breakdown=analysis.costs),
+                   hourly=analysis.hourly, members=analysis.members)
+    content = json.dumps(payload, indent=2, allow_nan=False) + '\n'
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / 'cap_only.json').write_text(content, encoding='utf-8')
 
 
 # ==========================================================

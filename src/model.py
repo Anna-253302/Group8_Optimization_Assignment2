@@ -1,4 +1,4 @@
-"""Assignment 2 consumer optimization building blocks and Q1 models R, I and C.
+"""Assignment 2 consumer optimization building blocks and models R, I, C and DP.
 
 Adapted from Assignment 1 FlexibleConsumerModel: physical balance, PV,
 linear absolute-deviation disutility, daily energy and cyclic battery SoC.
@@ -8,6 +8,7 @@ All hourly power values are average kW over one-hour intervals (numerically kWh)
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -23,15 +24,19 @@ from .data_loader import CommunityData, InputData
 
 @dataclass(frozen=True)
 class ModelConfiguration:
-    """Contract and metering configuration for Models R, I and C."""
+    """Contract and metering configuration for Models R, I and C and dynamic pricing (DP)."""
 
-    model_type: Literal["R", "I", "C"]
+    model_type: Literal["R", "I", "C" , "DP"]
 
     tariff_discount: float
 
     metering: Literal["individual", "community"]
 
     capacity_contract: Literal["none", "individual", "community"]
+
+    # Question 2: optional pricing requirements
+    budget_balance: bool = False
+    individual_rationality: bool = False
 
 
 def get_model_configuration(
@@ -61,6 +66,12 @@ def get_model_configuration(
             metering="community",
             capacity_contract="community",
         ),
+        "DP": ModelConfiguration(
+            model_type="DP",
+            tariff_discount=beta,
+            metering="community",
+            capacity_contract="community",
+        ),
     }
 
     if model_type not in configurations:
@@ -85,6 +96,7 @@ def add_consumer_constraints(
     member: InputData,
     *,
     terminal_soc: str = "cyclic",
+    prefix: str = "",
 ) -> ConsumerBlock:
     """Add one member's Assignment 1 LP constraints to an EXISTING model.
 
@@ -94,6 +106,7 @@ def add_consumer_constraints(
 
     terminal_soc='cyclic' requires SoC[24] == SoC[0].
     terminal_soc='free' leaves final SoC unconstrained (not recommended for R).
+    prefix namespaces all variables and rows for future scenario copies.
     """
     if terminal_soc not in {"cyclic", "free"}:
         raise ValueError("terminal_soc must be 'cyclic' or 'free'")
@@ -105,7 +118,7 @@ def add_consumer_constraints(
         raise ValueError(f"{member.consumer_id}: hourly bounds required")
     n = member.n_hours
     T = range(n)
-    name = member.consumer_id
+    name = f'{prefix}{member.consumer_id}'
     v: dict[str, Any] = {}
     c: dict[str, Any] = {}
     v['load'] = model.addVars(T, lb=0, name=f'{name}_load')
@@ -161,6 +174,90 @@ def add_consumer_constraints(
     return ConsumerBlock(member, v, c, physical_cost, disutility_cost, net_exchange)
 
 
+def add_consumer_kkt(model, block, prices, prefix):
+    """Enforce optimality of one continuous consumer LP at given hourly prices.
+
+    Only the block's variables/rows enter the follower; shared community rows
+    remain upper-level constraints. For Az=b, Gz<=h use free lambda and mu>=0:
+    stationarity is c + Q.T*x + A.T*lambda + G.T*mu = 0. The returned linear
+    dual objective is -b.T*lambda - h.T*mu (plus any objective constants).
+    Primal feasibility comes from the existing block and explicit bound slacks;
+    indicators impose complementarity without user-specified big-M values.
+    Scenario blocks can reuse this function with the same prices and unique prefixes.
+    """
+    model.update()  # Commit rows and variable bounds before inspecting the LP.
+
+    def leaves(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from leaves(item)
+        else:
+            yield value
+
+    variables = {var.index: var for var in leaves(block.variables)}
+    if any(var.VType != GRB.CONTINUOUS for var in variables.values()):
+        raise ValueError('Consumer KKT requires continuous follower variables')
+    stationarity = {index: gp.LinExpr() for index in variables}
+
+    def add_gradient(expression, multiplier=1.0):
+        expression = gp.LinExpr(expression)
+        for j in range(expression.size()):
+            index = expression.getVar(j).index
+            if index not in stationarity:
+                raise ValueError('Follower expression references a variable outside its block')
+            stationarity[index] += expression.getCoeff(j) * multiplier
+
+    local_cost = block.physical_cost + block.disutility_cost
+    add_gradient(local_cost)
+    dual_objective = gp.LinExpr(local_cost.getConstant())
+    for t, exchange in block.net_exchange.items():
+        add_gradient(exchange, prices[t])
+        dual_objective += exchange.getConstant() * prices[t]
+
+    def add_inequality(row, rhs, name):
+        """Add the dual and complementarity for a normalized row <= rhs."""
+        nonlocal dual_objective
+        dual = model.addVar(lb=0, name=f'{name}_dual')
+        slack = model.addVar(lb=0, name=f'{name}_slack')
+        active = model.addVar(vtype=GRB.BINARY, name=f'{name}_active')
+        model.addConstr(slack == rhs - row, name=f'{name}_slack_definition')
+        model.addGenConstrIndicator(active, 1, slack == 0,
+                                    name=f'{name}_binding')
+        model.addGenConstrIndicator(active, 0, dual == 0,
+                                    name=f'{name}_zero_dual')
+        add_gradient(row, dual)
+        dual_objective -= rhs * dual
+
+    for constraint in leaves(block.constraints):
+        row = model.getRow(constraint)
+        rhs = float(constraint.RHS)
+        name = f'{prefix}{constraint.ConstrName}'
+        if constraint.Sense == GRB.EQUAL:
+            dual = model.addVar(lb=-GRB.INFINITY, name=f'{name}_dual')
+            add_gradient(row, dual)
+            dual_objective -= rhs * dual
+        elif constraint.Sense == GRB.LESS_EQUAL:
+            add_inequality(row, rhs, name)
+        elif constraint.Sense == GRB.GREATER_EQUAL:
+            add_inequality(-row, -rhs, name)
+        else:
+            raise ValueError(f'Unsupported follower constraint sense: {constraint.Sense}')
+
+    # Bounds assigned via addVars are not explicit rows in block.constraints.
+    # Include even zero lower bounds and both endpoints of every SoC variable.
+    for var in variables.values():
+        if var.LB > -GRB.INFINITY:
+            add_inequality(-gp.LinExpr(var), -float(var.LB),
+                           f'{prefix}{var.VarName}_lb')
+        if var.UB < GRB.INFINITY:
+            add_inequality(gp.LinExpr(var), float(var.UB),
+                           f'{prefix}{var.VarName}_ub')
+    for index, gradient in stationarity.items():
+        model.addConstr(gradient == 0,
+                        name=f'{prefix}{variables[index].VarName}_stationarity')
+    return dual_objective
+
+
 @dataclass
 class ReferenceResult:
     """Primal solution and objective for one member in R or I; C uses diagnostic flows."""
@@ -178,14 +275,17 @@ class ReferenceResult:
 
 @dataclass
 class CommunityResult:
-    """Centralized dispatch: connection-point flows and community balance duals."""
+    """Community dispatch with C balance duals or optimized DP prices."""
     model_type: str
     objective_DKK: float
     member_results: dict[str, ReferenceResult]
     community_import_kW: np.ndarray
     community_export_kW: np.ndarray
     community_exceedance_kW: np.ndarray
-    balance_duals: np.ndarray
+    balance_duals: np.ndarray | None
+    internal_prices: np.ndarray | None = None
+    mip_gap: float | None = None
+    solver_status: int | None = None
 
 
 # ==========================================================
@@ -195,7 +295,7 @@ class CommunityResult:
 def solve_community(
     community: CommunityData,
     *,
-    model_type: Literal["R", "I", "C"] = "R",
+    model_type: Literal["R", "I", "C", "DP"] = "R",
     terminal_soc: str = "cyclic",
     verbose: bool = False,
 ):
@@ -205,6 +305,7 @@ def solve_community(
     R: Reference
     I: Individual contracts
     C: Centralized community contract
+    DP: Optimistic dynamic pricing, Cap Only (consumer KKT MILP)
     """
 
     optimization = CommunityModel(
@@ -461,19 +562,22 @@ def solve_individual_contracts(
 
 
 # ==========================================================
-# PARAMETRIZED COMMUNITY MODEL (R / I / C)
+# PARAMETRIZED COMMUNITY MODEL (R / I / C / DP)
 # ==========================================================
 
 class CommunityModel:
-    """One LP formulation, with metering and contract switches for R/I/C."""
+    """Shared physical LP for R/I/C; DP adds prices and follower KKT conditions."""
 
-    def __init__(self, community: CommunityData, model_type: Literal['R', 'I', 'C'] = 'R',
+    def __init__(self, community: CommunityData, model_type: Literal['R', 'I', 'C', 'DP'] = 'R',
                  terminal_soc: str = 'cyclic', verbose: bool = False):
         self.community = community
         self.config = get_model_configuration(community, model_type)
         self.terminal_soc = terminal_soc
         self.model = gp.Model(f'Community_{model_type}')
         self.model.Params.OutputFlag = int(verbose)
+        if model_type == 'DP':
+            self.model.Params.MIPGap = 1e-6
+            self.model.Params.TimeLimit = 300.0
         n = community.members[0].n_hours
         if any(member.n_hours != n for member in community.members):
             raise ValueError('All members must have the same hourly horizon')
@@ -485,6 +589,8 @@ class CommunityModel:
         self.community_export = None
         self.exceedance = None
         self.balance_constraints = None
+        self.internal_prices = None
+        self.follower_dual_objectives = {}
         self.penalty_cost = gp.LinExpr(0.0)
         self.objective_components = {}
 
@@ -492,6 +598,9 @@ class CommunityModel:
         self._build_consumers()
         self._build_metering()
         self._build_contract()
+        if self.config.model_type == 'DP':
+            self._build_internal_prices()
+            self._build_follower_optimality()
         self._build_objective()
         return self
 
@@ -537,13 +646,16 @@ class CommunityModel:
             ), name='community_balance')
             for member in self.community.members:
                 cid = member.consumer_id
-                net = self.blocks[cid].net_exchange
+                block = self.blocks[cid]
+                net = block.net_exchange
                 if member.max_import_kW is not None:
-                    m.addConstrs((net[t] <= member.max_import_kW for t in T),
-                                 name=f'{cid}_physical_import_limit')
+                    block.constraints['physical_import'] = m.addConstrs(
+                        (net[t] <= member.max_import_kW for t in T),
+                        name=f'{cid}_physical_import_limit')
                 if member.max_export_kW is not None:
-                    m.addConstrs((net[t] >= -member.max_export_kW for t in T),
-                                 name=f'{cid}_physical_export_limit')
+                    block.constraints['physical_export'] = m.addConstrs(
+                        (net[t] >= -member.max_export_kW for t in T),
+                        name=f'{cid}_physical_export_limit')
 
     def _build_contract(self):
         contract, T, m = self.community.contract, self.T, self.model
@@ -577,6 +689,28 @@ class CommunityModel:
                           for t in T), name='community_capacity_exceedance')
             self.penalty_cost = alpha * gp.quicksum(self.exceedance[t] for t in T)
 
+    def _build_internal_prices(self):
+        """Bound Cap-Only prices by the community's marginal external costs.
+
+        These are modeling choices for this DP variant; later Q2 variants
+        should make the price bounds configurable.
+        """
+        member = self.community.members[0]
+        beta = self.config.tariff_discount
+        alpha = float(self.community.contract.penalty_DKK_per_kWh)
+        lower = {t: float(member.energy_price[t]) - (1-beta)*member.export_tariff
+                 for t in self.T}
+        upper = {t: float(member.energy_price[t]) + (1-beta)*member.import_tariff + alpha
+                 for t in self.T}
+        self.internal_prices = self.model.addVars(
+            self.T, lb=lower, ub=upper, name='internal_price')
+
+    def _build_follower_optimality(self):
+        """Require optimal consumer responses, with optimistic tie breaking."""
+        for cid, block in self.blocks.items():
+            self.follower_dual_objectives[cid] = add_consumer_kkt(
+                self.model, block, self.internal_prices, prefix=f'kkt_{cid}_')
+
     def _build_objective(self):
         T, beta = self.T, self.config.tariff_discount
         physical = gp.quicksum(b.physical_cost for b in self.blocks.values())
@@ -606,7 +740,14 @@ class CommunityModel:
     def solve(self):
         self.model.optimize()
         if self.model.Status != GRB.OPTIMAL:
-            raise RuntimeError(f'Model {self.config.model_type}: Gurobi status {self.model.Status}')
+            if self.config.model_type != 'DP' or self.model.SolCount == 0:
+                detail = '; no feasible incumbent available' if self.model.SolCount == 0 else ''
+                raise RuntimeError(
+                    f'Model {self.config.model_type}: Gurobi status {self.model.Status}{detail}')
+            warnings.warn(
+                f'Model DP: returning a feasible incumbent, not proven optimal; '
+                f'Gurobi status {self.model.Status}, MIP gap {self.model.MIPGap:.6g}',
+                RuntimeWarning, stacklevel=2)
         return self._extract_results()
 
     def _extract_results(self):
@@ -614,6 +755,7 @@ class CommunityModel:
         def arr(vars_):
             return np.array([vars_[t].X for t in T], dtype=float)
 
+        prices = arr(self.internal_prices) if self.config.model_type == 'DP' else None
         results = {}
         beta = self.config.tariff_discount
         for member in self.community.members:
@@ -641,19 +783,26 @@ class CommunityModel:
                            * sum(self.exceedance[cid][t].X for t in T)
                            if self.config.model_type == 'I' else 0.0)
                 cost = float(procurement + physical + disutility + penalty)
+            elif self.config.model_type == 'DP':
+                cost = float(np.dot(prices, net) + block.physical_cost.getValue()
+                             + block.disutility_cost.getValue())
             results[cid] = ReferenceResult(
                 consumer_id=cid, objective_DKK=cost, load_kW=arr(v['load']),
                 pv_kW=arr(v['pv']), import_kW=imp, export_kW=exp,
                 net_exchange_kW=net, deviation_kW=arr(v['deviation']), soc_kWh=soc,
                 charge_kW=arr(v['charge']) if member.has_battery else None,
                 discharge_kW=arr(v['discharge']) if member.has_battery else None)
-        if self.config.model_type == 'C':
+        if self.config.model_type in {'C', 'DP'}:
             return CommunityResult(
-                model_type='C', objective_DKK=float(self.model.ObjVal),
+                model_type=self.config.model_type, objective_DKK=float(self.model.ObjVal),
                 member_results=results, community_import_kW=arr(self.community_import),
                 community_export_kW=arr(self.community_export),
                 community_exceedance_kW=arr(self.exceedance),
-                balance_duals=np.array([self.balance_constraints[t].Pi for t in T], dtype=float))
+                balance_duals=(np.array([self.balance_constraints[t].Pi for t in T], dtype=float)
+                               if self.config.model_type == 'C' else None),
+                internal_prices=prices,
+                mip_gap=float(self.model.MIPGap) if self.config.model_type == 'DP' else None,
+                solver_status=int(self.model.Status))
         total = sum(r.objective_DKK for r in results.values())
         if not np.isclose(total, self.model.ObjVal, atol=1e-5):
             raise RuntimeError(f'Member costs ({total}) differ from model objective ({self.model.ObjVal})')
