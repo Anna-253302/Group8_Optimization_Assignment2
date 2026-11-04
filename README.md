@@ -212,6 +212,58 @@ provided number. It can also be run alongside the existing settlement command:
 python main.py --model all --day d1 --settlement --reference-diagnostics
 ```
 
+### 1.6 Question 2: Dynamic Pricing, Cap Only
+
+Run the deterministic DP experiment and its R/I/C benchmarks with:
+
+```bash
+python main.py --model DP --day d1
+```
+
+The existing `--community` and `--verbose-solver` options also apply. Each of
+DP, R, I and C is solved once. `--model all` remains the Q1 R/I/C workflow;
+the Q1-only `--settlement`, `--sensitivity` and `--reference-diagnostics` options
+cannot be combined with `--model DP`.
+
+DP Cap Only optimizes one hourly internal price shared by all members. It uses
+C's shared meter, discounted tariffs, soft import cap and community objective,
+and enforces optimal consumer LP responses through KKT indicator constraints.
+Follower responses are optimistic: the manager may select among equally optimal
+responses. Prices and schedules can differ from C even when community costs agree;
+these differences do not establish a precise number of indifferent hours.
+The DP solver uses a 300-second time limit and relative MIP gap of `1e-6`.
+Reports distinguish a proven optimum (within solver tolerance) from a feasible
+incumbent after early termination, and include the actual status and gap.
+
+Budget balance and individual rationality against R/I are **evaluated, not
+enforced**. Member bills are internal payments plus PV cost and disutility.
+Manager surplus is payments minus the external energy, discounted tariffs and
+DSO penalties; no surplus is redistributed. The accounting identity checked is
+`sum(DP member bills) = DP community objective + manager surplus`.
+The C-specific cap-rent identity is not imposed on DP prices.
+
+DP writes exactly one file: `results/<community>/<day>/DP/cap_only.json`.
+It contains three keys:
+
+| Key | Content |
+|---|---|
+| `summary` | R/I/C/DP objectives, C/DP cost breakdowns, efficiency loss, meter metrics, solver status/gap, price differences, manager budget, participation diagnostics, units, tolerances and validation |
+| `hourly` | DP optimized prices, C balance duals (Pi without a sign flip), external prices, C/DP imports/exports, cap, payments and hourly manager budget |
+| `members` | Metadata, R/I benchmarks, DP payments/local costs, gains and IR flags for every member |
+
+No DP CSVs or plots are generated automatically. Existing output files are left
+in place for manual cleanup. Shared comparison plots will be added later.
+
+Analysis checks hourly power balance, nonnegative meter flows, actual positive-part
+cap exceedance, both community cost breakdowns, member bills, payment aggregation,
+the manager accounting identity and C's lower-bound cost. Checks use absolute
+`1e-5` tolerances (DKK or kW/kWh as applicable), with zero relative tolerance;
+failed validations raise errors. JSON excludes NaN/Infinity; an unavailable MIP
+gap is `null`. Unit tests exercise transfers, diagnostic gains, validation failures,
+early-termination reporting and exports. Run them with
+`python -m unittest discover -s tests -v`, and run the Q1 regression with
+`python main.py --model all --day d1 --settlement`.
+
 ## 2. Repository structure
 
 The same division of responsibilities as Assignment 1 is used. Experiment

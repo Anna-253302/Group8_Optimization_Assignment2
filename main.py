@@ -3,6 +3,7 @@
 Examples:
     python main.py --model all --day d1
     python main.py --model all --day d1 --settlement
+    python main.py --model DP --day d1
     python main.py --day d1 --sensitivity both --reference-diagnostics
 
 R, I and C use the shared parametrized model in src/model.py. Experiment
@@ -32,6 +33,8 @@ from src.analysis import (
     export_settlement,
     analyse_contract_sensitivity,
     export_contract_sensitivity,
+    analyse_dp,
+    export_dp_analysis,
 )
 from src.plotting import plot_feeder_import, plot_settlement, plot_contract_sensitivity
 
@@ -121,6 +124,43 @@ def run_base_case(
         plot_feeder_import(community, results, output_dir)
         print(f"\nFigure saved to: {output_dir}")
     return results
+
+
+def run_dp_cap_only(community, output_dir, *, verbose=False):
+    """Solve each of DP/R/I/C once and report the deterministic Q2 experiment.
+
+    output_dir is the DP directory; Q1 runners and their exports
+    are separate. Budget balance and individual rationality are diagnostics.
+    """
+    started = time.perf_counter()
+    results = {}
+    for kind in ('DP', 'R', 'I', 'C'):
+        print(f'\nSolving Model {kind} for DP Cap Only...', flush=True)
+        results[kind] = solve_community(community, model_type=kind, verbose=verbose)
+    analysis = analyse_dp(community, results['R'], results['I'], results['C'], results['DP'])
+    export_dp_analysis(analysis, output_dir)
+
+    s = analysis.summary
+    print('\nQ2 - DYNAMIC PRICING, CAP ONLY')
+    for kind, cost in s['objectives_DKK'].items():
+        print(f'Model {kind:>2} community cost: {cost:.6f} DKK')
+    solution = 'optimal within solver tolerance' if s['dp_proven_optimal'] else 'feasible incumbent; optimality not proven'
+    gap = 'unavailable' if s['mip_gap'] is None else f"{s['mip_gap']:.6%}"
+    print(f"DP solution: {solution}; status={s['solver_status_name']} ({s['solver_status']}), gap={gap}")
+    print(f"DP minus C cost: {s['efficiency_loss_DKK']:.9f} DKK; "
+          f"equal within {s['tolerance']:g} DKK: {s['objectives_equal_within_tolerance']}")
+    print(f"DP import/export: {s['daily_import_kWh']:.3f} / {s['daily_export_kWh']:.3f} kWh; "
+          f"peak import: {s['peak_import_kW']:.3f} kW")
+    print(f"DP cap exceedance: {s['exceedance_kWh']:.3f} kWh in {s['congested_hours']} hours")
+    print(f"DP/C absolute price difference: max {s['max_absolute_price_difference_DKK_per_kWh']:.6f}, "
+          f"mean {s['mean_absolute_price_difference_DKK_per_kWh']:.6f} DKK/kWh")
+    print(f"Member payments: {s['total_payments_DKK']:.6f} DKK; external grid bill: {s['external_bill_DKK']:.6f} DKK")
+    print(f"Manager surplus: {s['manager_surplus_DKK']:.6f} DKK; budget balanced: {s['manager_budget_balanced']} (diagnostic)")
+    print('Members worse off vs R:', ', '.join(s['worse_off_vs_R']) or 'none')
+    print('Members worse off vs I:', ', '.join(s['worse_off_vs_I']) or 'none')
+    print(f"Accounting residual: {s['accounting_identity_residual_DKK']:.3g} DKK; validation: PASS")
+    print(f"DP results saved to {Path(output_dir) / 'cap_only.json'} ({time.perf_counter() - started:.1f} s)")
+    return analysis
 
 
 def refine_crossings(points, evaluate, tolerance=.005):
@@ -269,8 +309,8 @@ def main() -> None:
     ap.add_argument("--day", default="d1", help="d1 (base case) ... d7")
     ap.add_argument("--members", action="store_true", help="Print every member's input summary")
     ap.add_argument("--demo", action="store_true", help="Run the Question 3 scenario demonstration")
-    ap.add_argument("--model", choices=["R", "I", "C", "both", "all", "none"], default="all",
-                    help="R, I, C, both (R+I), all, or none")
+    ap.add_argument("--model", choices=["R", "I", "C", "DP", "both", "all", "none"], default="all",
+                    help="R, I, C, DP (Q2 Cap Only), both (R+I), all (R+I+C), or none")
     ap.add_argument("--verbose-solver", action="store_true", help="Show Gurobi solver output")
     ap.add_argument("--settlement", action="store_true",
                     help="Calculate member benefits and manager budget (requires --model all)")
@@ -284,6 +324,8 @@ def main() -> None:
     ap.add_argument("--reference-diagnostics", action="store_true",
                     help="Certify R's exceedance range across alternative economic optima")
     args = ap.parse_args()
+    if args.model == "DP" and (args.settlement or args.sensitivity or args.reference_diagnostics):
+        ap.error("DP has its own analysis; --settlement, --sensitivity and --reference-diagnostics are Q1-only")
     if (args.settlement or args.sensitivity) and args.model != "all":
         ap.error("--settlement/--sensitivity requires --model all to calculate both member benchmarks")
     if (args.discount_values or args.cap_factors or args.no_refine) and not args.sensitivity:
@@ -303,8 +345,11 @@ def main() -> None:
     if args.members:
         for member in community.members:
             print(member.summary(), "\n")
-    run_base_case(community, output_dir, model=args.model, settlement=args.settlement,
-                  reference_diagnostics=args.reference_diagnostics, verbose=args.verbose_solver)
+    if args.model == "DP":
+        run_dp_cap_only(community, output_dir / "DP", verbose=args.verbose_solver)
+    else:
+        run_base_case(community, output_dir, model=args.model, settlement=args.settlement,
+                      reference_diagnostics=args.reference_diagnostics, verbose=args.verbose_solver)
     if args.demo:
         import runpy
         runpy.run_module("src.scenario_generation", run_name="__main__")

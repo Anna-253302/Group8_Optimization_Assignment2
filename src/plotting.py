@@ -12,7 +12,7 @@ def plot_feeder_import(
     output_dir,
 ):
     """
-    Question 1: Compare hourly feeder imports against the DSO capacity limit.
+    Compare hourly metered feeder imports against the DSO capacity limit.
 
     Parameters
     ----------
@@ -41,7 +41,7 @@ def plot_feeder_import(
 
     for model_name, model_results in results.items():
 
-        if model_name == "C":
+        if model_name in {"C", "DP"}:
 
             # Community-meter import after internal netting
             feeder_import = np.asarray(
@@ -60,12 +60,15 @@ def plot_feeder_import(
                 axis=0,
             )
 
+        # A dashed DP curve keeps C visible when their selected imports coincide.
+        style = dict(color="#9467bd", linestyle="--") if model_name == "DP" else {}
         ax.step(
             hours,
             feeder_import,
             where="mid",
             linewidth=2,
             label=f"Model {model_name}",
+            **style,
         )
         
     # DSO capacity limit
@@ -144,29 +147,44 @@ def plot_settlement(result, output_dir):
         fig.savefig(output_dir / f"settlement_prices.{suffix}", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
-    classes = sorted({row["slope_class"] for row in result.members})
+    _plot_member_gains(result.members, output_dir,
+                       title="Member gains under dual settlement", stem="settlement_member_gains")
+
+
+def _plot_member_gains(members, output_dir, *, title, stem, show_assets=False):
+    """Shared slope-class panels; default settings preserve the Q1 figure."""
+    classes = sorted({row["slope_class"] for row in members})
     ncols = min(2, len(classes))
     nrows = (len(classes) + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(10, 3 * nrows), sharey=True, squeeze=False)
     for ax, slope in zip(axes.flat, classes):
-        rows = [row for row in result.members if row["slope_class"] == slope]
+        rows = [row for row in members if row["slope_class"] == slope]
         x = np.arange(len(rows))
         ax.bar(x - 0.18, [row["gain_vs_R_DKK"] for row in rows], width=0.36,
                label="Gain vs R", color="#1f77b4")
         ax.bar(x + 0.18, [row["gain_vs_I_DKK"] for row in rows], width=0.36,
                label="Gain vs I", color="#ff7f0e")
         ax.axhline(0, color="black", linewidth=0.8)
-        ax.set_xticks(x, [row["consumer_id"] for row in rows], rotation=25, ha="right")
+        labels = [row['consumer_id'] for row in rows]
+        if show_assets:
+            labels = [row['consumer_id'] + '\nLoad' + ('+PV' if row['has_pv'] else '')
+                      + ('+BAT' if row['has_battery'] else '') for row in rows]
+        ax.set_xticks(x, labels, rotation=25, ha="right")
         ax.set_title(f"Disutility class L{slope}")
         ax.set_ylabel("Member gain [DKK/day]")
         ax.grid(axis="y", alpha=0.25)
     for ax in list(axes.flat)[len(classes):]:
         ax.set_visible(False)
     axes[0, 0].legend()
-    fig.suptitle("Member gains under dual settlement", fontsize=12)
-    fig.tight_layout()
+    fig.suptitle(title, fontsize=12)
+    if show_assets:
+        fig.text(.5, .01, 'Positive = savings; negative = worse off. No surplus is redistributed.',
+                 ha='center', fontsize=9)
+        fig.tight_layout(rect=(0, .04, 1, 1))
+    else:
+        fig.tight_layout()
     for suffix in ("png", "pdf"):
-        fig.savefig(output_dir / f"settlement_member_gains.{suffix}", dpi=200, bbox_inches="tight")
+        fig.savefig(output_dir / f"{stem}.{suffix}", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
