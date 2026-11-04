@@ -126,22 +126,24 @@ def run_base_case(
     return results
 
 
-def run_dp_cap_only(community, output_dir, *, verbose=False):
+def run_dp_cap_only(community, output_dir, *, verbose=False, budget_balance=False):
     """Solve each of DP/R/I/C once and report the deterministic Q2 experiment.
 
     output_dir is the DP directory; Q1 runners and their exports
-    are separate. Budget balance and individual rationality are diagnostics.
+    are separate. Budget balance is optional; individual rationality is diagnostic.
     """
     started = time.perf_counter()
     results = {}
+    variant = 'Budget Balance' if budget_balance else 'Cap Only'
     for kind in ('DP', 'R', 'I', 'C'):
-        print(f'\nSolving Model {kind} for DP Cap Only...', flush=True)
-        results[kind] = solve_community(community, model_type=kind, verbose=verbose)
+        print(f'\nSolving Model {kind} for DP {variant}...', flush=True)
+        options = {'budget_balance': True} if kind == 'DP' and budget_balance else {}
+        results[kind] = solve_community(community, model_type=kind, verbose=verbose, **options)
     analysis = analyse_dp(community, results['R'], results['I'], results['C'], results['DP'])
-    export_dp_analysis(analysis, output_dir)
+    output_path = export_dp_analysis(analysis, output_dir)
 
     s = analysis.summary
-    print('\nQ2 - DYNAMIC PRICING, CAP ONLY')
+    print(f'\nQ2 - DYNAMIC PRICING, {variant.upper()}')
     for kind, cost in s['objectives_DKK'].items():
         print(f'Model {kind:>2} community cost: {cost:.6f} DKK')
     solution = 'optimal within solver tolerance' if s['dp_proven_optimal'] else 'feasible incumbent; optimality not proven'
@@ -155,11 +157,12 @@ def run_dp_cap_only(community, output_dir, *, verbose=False):
     print(f"DP/C absolute price difference: max {s['max_absolute_price_difference_DKK_per_kWh']:.6f}, "
           f"mean {s['mean_absolute_price_difference_DKK_per_kWh']:.6f} DKK/kWh")
     print(f"Member payments: {s['total_payments_DKK']:.6f} DKK; external grid bill: {s['external_bill_DKK']:.6f} DKK")
-    print(f"Manager surplus: {s['manager_surplus_DKK']:.6f} DKK; budget balanced: {s['manager_budget_balanced']} (diagnostic)")
+    requirement = 'enforced' if budget_balance else 'diagnostic'
+    print(f"Manager surplus: {s['manager_surplus_DKK']:.6f} DKK; budget balanced: {s['manager_budget_balanced']} ({requirement})")
     print('Members worse off vs R:', ', '.join(s['worse_off_vs_R']) or 'none')
     print('Members worse off vs I:', ', '.join(s['worse_off_vs_I']) or 'none')
     print(f"Accounting residual: {s['accounting_identity_residual_DKK']:.3g} DKK; validation: PASS")
-    print(f"DP results saved to {Path(output_dir) / 'cap_only.json'} ({time.perf_counter() - started:.1f} s)")
+    print(f'DP results saved to {output_path} ({time.perf_counter() - started:.1f} s)')
     return analysis
 
 
@@ -312,6 +315,7 @@ def main() -> None:
     ap.add_argument("--model", choices=["R", "I", "C", "DP", "both", "all", "none"], default="all",
                     help="R, I, C, DP (Q2 Cap Only), both (R+I), all (R+I+C), or none")
     ap.add_argument("--verbose-solver", action="store_true", help="Show Gurobi solver output")
+    ap.add_argument("--budget-balance", action="store_true", help="Enforce budget balance (requires --model DP)")
     ap.add_argument("--settlement", action="store_true",
                     help="Calculate member benefits and manager budget (requires --model all)")
     ap.add_argument("--sensitivity", choices=["discount", "cap", "both"],
@@ -324,6 +328,8 @@ def main() -> None:
     ap.add_argument("--reference-diagnostics", action="store_true",
                     help="Certify R's exceedance range across alternative economic optima")
     args = ap.parse_args()
+    if args.budget_balance and args.model != 'DP':
+        ap.error('--budget-balance requires --model DP')
     if args.model == "DP" and (args.settlement or args.sensitivity or args.reference_diagnostics):
         ap.error("DP has its own analysis; --settlement, --sensitivity and --reference-diagnostics are Q1-only")
     if (args.settlement or args.sensitivity) and args.model != "all":
@@ -346,7 +352,8 @@ def main() -> None:
         for member in community.members:
             print(member.summary(), "\n")
     if args.model == "DP":
-        run_dp_cap_only(community, output_dir / "DP", verbose=args.verbose_solver)
+        run_dp_cap_only(community, output_dir / "DP", verbose=args.verbose_solver,
+                        budget_balance=args.budget_balance)
     else:
         run_base_case(community, output_dir, model=args.model, settlement=args.settlement,
                       reference_diagnostics=args.reference_diagnostics, verbose=args.verbose_solver)
