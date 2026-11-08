@@ -7,7 +7,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import matplotlib
 matplotlib.use('Agg')
@@ -149,7 +149,7 @@ class DPAnalysisTests(unittest.TestCase):
         community, reference, individual, centralized, dp = self.case
         results = {'R': reference, 'I': individual, 'C': centralized, 'DP': dp}
         folder = self.temporary_output()
-        with patch('main.solve_community', side_effect=lambda c, model_type, verbose: results[model_type]) as solver, \
+        with patch('main.solve_community', side_effect=lambda c, model_type, verbose, **kwargs: results[model_type]) as solver, \
              patch('main.plot_feeder_import') as plot, redirect_stdout(io.StringIO()):
             main.run_dp_cap_only(community, folder, verbose=True)
         self.assertEqual([call.kwargs['model_type'] for call in solver.call_args_list], ['R', 'I', 'C', 'DP'])
@@ -361,6 +361,260 @@ class DPAnalysisTests(unittest.TestCase):
                          {cid: own.objective_DKK for cid, own in reference.items()})
         self.assertTrue(solver.call_args.kwargs['individual_rationality'])
 
+    def test_feasibility_cli_uses_only_one_reference_solve(self):
+        args = ['main.py', '--model', 'DP', '--budget-balance', '--individual-rationality', '--feasibility-check']
+        with patch('sys.argv', args), patch('main.load_community', return_value=self.case[0]), \
+             patch('main.solve_community', return_value=self.case[1]) as solver, \
+             patch('main.diagnose_bb_ir_feasibility') as diagnose, \
+             patch('main.run_dp_cap_only') as ordinary, patch('main.export_dp_analysis') as export, \
+             redirect_stdout(io.StringIO()):
+            main.main()
+        solver.assert_called_once_with(self.case[0], model_type='R', verbose=False)
+        diagnose.assert_called_once_with(self.case[0], self.case[1], price_bound_extension=0.0)
+        ordinary.assert_not_called()
+        export.assert_not_called()
+        for invalid in (['--model', 'DP', '--budget-balance'], ['--model', 'DP', '--individual-rationality'],
+                        ['--model', 'C']):
+            with self.subTest(args=invalid), patch('sys.argv', ['main.py', '--feasibility-check'] + invalid), \
+                 redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                main.main()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_feasibility_status_without_incumbent(self):
+        for status, conclusion in ((GRB.INFEASIBLE, 'proven infeasible'),
+                                   (GRB.TIME_LIMIT, 'unresolved'), (GRB.INTERRUPTED, 'unresolved')):
+            model = Mock(Status=status, SolCount=0, Runtime=300.0)
+            model.Params = SimpleNamespace(TimeLimit=300, MIPFocus=0, SolutionLimit=2000000000)
+            optimization = Mock(model=model)
+            with self.subTest(status=status), patch('main.CommunityModel', return_value=optimization) as constructor, \
+                 redirect_stdout(io.StringIO()):
+                result = main.diagnose_bb_ir_feasibility(self.case[0], self.case[1], price_bound_extension=0.5)
+            self.assertIn(conclusion, result['feasibility_conclusion'])
+            self.assertNotIn('actual_community_cost_DKK', result)
+            model.getObjective.return_value.getValue.assert_not_called()
+            model.setObjective.assert_called_once_with(0.0, GRB.MINIMIZE)
+            self.assertEqual((model.Params.TimeLimit, model.Params.MIPFocus, model.Params.SolutionLimit), (300, 1, 1))
+            self.assertEqual(constructor.call_args.kwargs['price_bound_extension'], 0.5)
+            self.assertTrue(constructor.call_args.kwargs['individual_rationality'])
+            optimization.solve.assert_not_called()
+            model.dispose.assert_called_once()
+
+    def test_ir_slack_cli_activation_and_exclusivity(self):
+        args = ['main.py', '--model', 'DP', '--budget-balance', '--individual-rationality', '--ir-slack-check']
+        with patch('sys.argv', args), patch('main.load_community', return_value=self.case[0]), \
+             patch('main.solve_community', return_value=self.case[1]) as solver, \
+             patch('main.diagnose_bb_ir_slacks') as diagnose, \
+             patch('main.diagnose_bb_ir_feasibility') as feasibility, \
+             patch('main.run_dp_cap_only') as ordinary, patch('main.export_dp_analysis') as export, \
+             redirect_stdout(io.StringIO()):
+            main.main()
+        solver.assert_called_once_with(self.case[0], model_type='R', verbose=False)
+        diagnose.assert_called_once_with(self.case[0], self.case[1], price_bound_extension=0.0)
+        feasibility.assert_not_called()
+        ordinary.assert_not_called()
+        export.assert_not_called()
+        for invalid in (args + ['--feasibility-check'], ['main.py', '--model', 'DP', '--ir-slack-check'],
+                        ['main.py', '--model', 'C', '--ir-slack-check']):
+            with self.subTest(args=invalid), patch('sys.argv', invalid), \
+                 redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                main.main()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_ir_slack_structure_and_no_incumbent_handling(self):
+        community = load_community('base')
+        refs = {cid: SimpleNamespace(objective_DKK=1.0) for cid in community.member_ids}
+        for invalid in ({}, {**refs, community.member_ids[0]: SimpleNamespace(objective_DKK=float('nan'))}):
+            with self.subTest(refs=invalid), patch('main.CommunityModel') as constructor, self.assertRaises(ValueError):
+                main.diagnose_bb_ir_slacks(community, invalid)
+            constructor.assert_not_called()
+        for status, conclusion in ((GRB.TIME_LIMIT, 'unresolved'), (GRB.INFEASIBLE, 'not solely hard IR')):
+            model = Mock(Status=status, SolCount=0, Runtime=300.0, ObjBound=0.0)
+            model.Params = SimpleNamespace(TimeLimit=300, MIPFocus=0, SolutionLimit=2000000000)
+            # Constant linear stand-ins exercise construction without a solver run.
+            model.addVars.return_value = {cid: gp.LinExpr(0.0) for cid in refs}
+            optimization = Mock(model=model, blocks=dict.fromkeys(refs),
+                                follower_dual_objectives={cid: gp.LinExpr(1.0) for cid in refs})
+            with self.subTest(status=status), patch('main.CommunityModel', return_value=optimization) as constructor, \
+                 redirect_stdout(io.StringIO()):
+                report = main.diagnose_bb_ir_slacks(community, refs, price_bound_extension=2.0)
+            self.assertTrue(constructor.call_args.kwargs['budget_balance'])
+            self.assertFalse(constructor.call_args.kwargs['individual_rationality'])
+            self.assertEqual(constructor.call_args.kwargs['price_bound_extension'], 2.0)
+            model.addVars.assert_called_once_with(community.member_ids, lb=0.0, name='ir_slack')
+            self.assertEqual(model.addConstr.call_count, 16)
+            self.assertEqual({call.kwargs['name'] for call in model.addConstr.call_args_list},
+                             {f'ir_relaxed_{cid}' for cid in refs})
+            self.assertIsInstance(model.setObjective.call_args.args[0], gp.LinExpr)
+            self.assertEqual(model.Params.SolutionLimit, 2000000000)
+            self.assertEqual((model.Params.TimeLimit, model.Params.MIPFocus), (300, 1))
+            model.getObjective.return_value.getValue.assert_not_called()
+            self.assertNotIn('actual_community_cost_DKK', report)
+            self.assertIn(conclusion, report['feasibility_conclusion'])
+            model.dispose.assert_called_once()
+
+    def test_feasibility_solution_limit_checks_actual_cost(self):
+        self.case[1]['supplier'].objective_DKK = -2.8
+        for first_price in (2.75, 4.0):
+            model = Mock(Status=GRB.SOLUTION_LIMIT, SolCount=1, Runtime=12.5, ObjVal=0.0)
+            model.Params = SimpleNamespace()
+            model.getObjective.return_value.getValue.return_value = 3.65
+            blocks = {}
+            for member in self.case[0].members:
+                own = self.case[-1].member_results[member.consumer_id]
+                blocks[member.consumer_id] = SimpleNamespace(
+                    physical_cost=Mock(getValue=Mock(return_value=member.pv_marginal_cost * own.pv_kW.sum())),
+                    disutility_cost=Mock(getValue=Mock(return_value=0.0)),
+                    net_exchange={t: Mock(getValue=Mock(return_value=float(net)))
+                                  for t, net in enumerate(own.net_exchange_kW)})
+            optimization = Mock(model=model, T=range(2), blocks=blocks,
+                                internal_prices={0: SimpleNamespace(X=first_price), 1: SimpleNamespace(X=2.0)},
+                                objective_components={'procurement': Mock(getValue=Mock(return_value=0.5)),
+                                                      'penalty': Mock(getValue=Mock(return_value=3.0))})
+            with self.subTest(price=first_price), patch('main.CommunityModel', return_value=optimization), \
+                 redirect_stdout(io.StringIO()):
+                if first_price == 4.0:
+                    with self.assertRaisesRegex(ValueError, 'failed independent'):
+                        main.diagnose_bb_ir_feasibility(self.case[0], self.case[1])
+                else:
+                    result = main.diagnose_bb_ir_feasibility(self.case[0], self.case[1])
+                    self.assertEqual(result['solver_status_name'], 'SOLUTION_LIMIT')
+                    self.assertTrue(result['validation_passed'])
+                    self.assertAlmostEqual(result['actual_community_cost_DKK'], 3.65)
+                    self.assertAlmostEqual(result['bb_residual_DKK'], 0.0)
+                    self.assertEqual(result['violating_member_count'], 0)
+
+
+    def test_price_bound_extension_validation_and_forwarding(self):
+        from src.model import solve_community
+
+        community = load_community('base')
+        for delta in (-0.1, float('nan'), float('inf'), -float('inf')):
+            with self.subTest(delta=delta), patch('src.model.gp.Model') as constructor:
+                with self.assertRaises(ValueError):
+                    CommunityModel(community, 'DP', price_bound_extension=delta)
+                constructor.assert_not_called()
+        for kind in ('R', 'I', 'C'):
+            with self.subTest(model=kind), patch('src.model.gp.Model') as constructor:
+                with self.assertRaises(ValueError):
+                    CommunityModel(community, kind, price_bound_extension=0.5)
+                constructor.assert_not_called()
+                CommunityModel(community, kind)  # Zero remains valid for Q1.
+        with patch('src.model.CommunityModel') as constructor:
+            solve_community(community, model_type='DP', budget_balance=True,
+                            individual_rationality=True, reference_costs_DKK={'buyer': 1},
+                            price_bound_extension=2.0)
+        self.assertEqual(constructor.call_args.kwargs['price_bound_extension'], 2.0)
+        self.assertTrue(constructor.call_args.kwargs['budget_balance'])
+        self.assertTrue(constructor.call_args.kwargs['individual_rationality'])
+        constructor.return_value.build.assert_called_once()
+        constructor.return_value.solve.assert_called_once()
+
+    def test_extension_changes_only_price_bounds(self):
+        community = load_community('base')
+        refs = {cid: 100.0 for cid in community.member_ids}
+        baseline = None
+        for delta in (0.0, 0.5, 2.0):
+            opt = CommunityModel(community, 'DP', budget_balance=True,
+                                 individual_rationality=True, reference_costs_DKK=refs,
+                                 price_bound_extension=delta)
+            try:
+                opt.build()
+                model = opt.model
+                model.update()
+                member = community.members[0]
+                discount = 1 - community.contract.tariff_discount_ratio
+                lower = member.energy_price - discount * member.export_tariff
+                upper = (member.energy_price + discount * member.import_tariff
+                         + community.contract.penalty_DKK_per_kWh)
+                np.testing.assert_array_equal([opt.internal_prices[t].LB for t in opt.T], lower - delta)
+                np.testing.assert_array_equal([opt.internal_prices[t].UB for t in opt.T], upper + delta)
+                # All linear rows (including BB, IR and KKT), objective and
+                # non-price variable bounds must be identical; no optimization.
+                structure = (
+                    [(row.ConstrName, row.Sense, row.RHS,
+                      [(model.getRow(row).getVar(j).VarName, model.getRow(row).getCoeff(j))
+                       for j in range(model.getRow(row).size())]) for row in model.getConstrs()],
+                    [(v.VarName, v.VType, v.Obj,
+                      None if v.VarName.startswith('internal_price[') else (v.LB, v.UB))
+                     for v in model.getVars()],
+                    model.NumSOS, model.NumGenConstrs, model.ObjCon, model.ModelSense)
+                if baseline is None:
+                    baseline = structure
+                else:
+                    self.assertEqual(structure, baseline)
+                self.assertEqual(model.Params.TimeLimit, 300)
+                self.assertEqual(model.Params.MIPGap, 1e-6)
+            finally:
+                opt.model.dispose()
+
+    def test_extended_analysis_and_exports_protect_baselines(self):
+        folder = self.temporary_output()
+        for variant in ('DP_cap_only', 'DP_budget_balance', 'DP_budget_balance_ir'):
+            baseline = analyse_dp(*self.case)
+            baseline.summary['model_variant'] = variant
+            path = export_dp_analysis(baseline, folder)
+            original = path.read_bytes()
+            for delta, label in ((0.5, '0p5'), (2.0, '2')):
+                case = copy.deepcopy(self.case)
+                dp = case[-1]
+                dp.price_bound_extension = delta
+                dp.best_bound_DKK = 3.6
+                # Use the extended upper bound, outside the original interval.
+                dp.internal_prices[0] = 4.2 + delta
+                for member in case[0].members:
+                    own = dp.member_results[member.consumer_id]
+                    own.objective_DKK = float(dp.internal_prices @ own.net_exchange_kW
+                                             + member.pv_marginal_cost * own.pv_kW.sum())
+                result = analyse_dp(*case)
+                result.summary['model_variant'] = variant
+                output = export_dp_analysis(result, folder)
+                self.assertEqual(output, folder / 'price_bound_sensitivity' / f'delta_{label}' / path.name)
+                self.assertEqual(path.read_bytes(), original)
+                payload = json.loads(output.read_text())
+                self.assertEqual(set(payload), {'summary', 'hourly', 'members'})
+                self.assertEqual(payload['summary']['price_bound_extension_DKK_per_kWh'], delta)
+                self.assertEqual(payload['summary']['best_bound_DKK'], 3.6)
+                dp.price_bound_extension = 0.0
+                with self.assertRaisesRegex(ValueError, 'configured price bounds'):
+                    analyse_dp(*case)
+
+    def test_runner_forwards_extension_only_to_dp(self):
+        community, reference, individual, centralized, dp = self.case
+        dp.price_bound_extension = 0.5
+        folder = self.temporary_output()
+        with patch('main.solve_community', side_effect=[reference, individual, centralized, dp]) as solver, \
+             redirect_stdout(io.StringIO()):
+            main.run_dp_cap_only(community, folder, price_bound_extension=0.5)
+        self.assertEqual([call.kwargs['model_type'] for call in solver.call_args_list], ['R', 'I', 'C', 'DP'])
+        for call in solver.call_args_list[:3]:
+            self.assertNotIn('price_bound_extension', call.kwargs)
+        self.assertEqual(solver.call_args.kwargs['price_bound_extension'], 0.5)
+        self.assertFalse((folder / 'cap_only.json').exists())
+        self.assertTrue((folder / 'price_bound_sensitivity' / 'delta_0p5' / 'cap_only.json').exists())
+
+    def test_extension_cli_routes_and_invalid_values(self):
+        for option, target in ((None, 'run_dp_cap_only'),
+                               ('--feasibility-check', 'diagnose_bb_ir_feasibility'),
+                               ('--ir-slack-check', 'diagnose_bb_ir_slacks')):
+            args = ['main.py', '--model', 'DP', '--budget-balance',
+                    '--individual-rationality', '--price-bound-extension', '0.5']
+            if option:
+                args.append(option)
+            with self.subTest(option=option), patch('sys.argv', args), \
+                 patch('main.load_community', return_value=self.case[0]), \
+                 patch('main.solve_community', return_value=self.case[1]), \
+                 patch(f'main.{target}') as runner, redirect_stdout(io.StringIO()):
+                main.main()
+            self.assertEqual(runner.call_args.kwargs['price_bound_extension'], 0.5)
+        for kind, value in (('DP', '-1'), ('DP', 'nan'), ('DP', 'inf'), ('DP', '-inf'),
+                            ('R', '0.5'), ('I', '0.5'), ('C', '0.5'), ('all', '2')):
+            with self.subTest(model=kind, value=value), \
+                 patch('sys.argv', ['main.py', '--model', kind, f'--price-bound-extension={value}']), \
+                 patch('main.load_community') as loader, redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as error:
+                main.main()
+            self.assertEqual(error.exception.code, 2)
+            loader.assert_not_called()
 
 if __name__ == '__main__':
     unittest.main()

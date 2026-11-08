@@ -299,6 +299,8 @@ class CommunityResult:
     solver_status: int | None = None
     budget_balance: bool = False
     individual_rationality: bool = False
+    price_bound_extension: float = 0.0
+    best_bound_DKK: float | None = None
 
 
 # ==========================================================
@@ -314,6 +316,7 @@ def solve_community(
     budget_balance: bool = False,
     individual_rationality: bool = False,
     reference_costs_DKK: dict[str, float] | None = None,
+    price_bound_extension: float = 0.0,
 ):
     """
     Solve the selected community optimization configuration.
@@ -332,6 +335,7 @@ def solve_community(
         budget_balance=budget_balance,
         individual_rationality=individual_rationality,
         reference_costs_DKK=reference_costs_DKK,
+        price_bound_extension=price_bound_extension,
     )
 
     optimization.build()
@@ -589,7 +593,15 @@ class CommunityModel:
 
     def __init__(self, community: CommunityData, model_type: Literal['R', 'I', 'C', 'DP'] = 'R',
                  terminal_soc: str = 'cyclic', verbose: bool = False, *, budget_balance: bool = False,
-                 individual_rationality: bool = False, reference_costs_DKK: dict[str, float] | None = None):
+                 individual_rationality: bool = False, reference_costs_DKK: dict[str, float] | None = None,
+                 price_bound_extension: float = 0.0):
+        self.price_bound_extension = float(price_bound_extension)
+        if not np.isfinite(self.price_bound_extension):
+            raise ValueError('Price bound extension must be finite')
+        if self.price_bound_extension < 0:
+            raise ValueError('Price bound extension must be non-negative')
+        if self.price_bound_extension != 0 and model_type != 'DP':
+            raise ValueError('Price bound extension is only supported for Model DP')
         self.community = community
         self.config = get_model_configuration(community, model_type, budget_balance=budget_balance,
                                               individual_rationality=individual_rationality)
@@ -717,17 +729,14 @@ class CommunityModel:
             self.penalty_cost = alpha * gp.quicksum(self.exceedance[t] for t in T)
 
     def _build_internal_prices(self):
-        """Bound Cap-Only prices by the community's marginal external costs.
-
-        These are modeling choices for this DP variant; later Q2 variants
-        should make the price bounds configurable.
-        """
+        """Extend the marginal-external-cost price bounds symmetrically."""
         member = self.community.members[0]
         beta = self.config.tariff_discount
         alpha = float(self.community.contract.penalty_DKK_per_kWh)
-        lower = {t: float(member.energy_price[t]) - (1-beta)*member.export_tariff
+        delta = self.price_bound_extension
+        lower = {t: float(member.energy_price[t]) - (1-beta)*member.export_tariff - delta
                  for t in self.T}
-        upper = {t: float(member.energy_price[t]) + (1-beta)*member.import_tariff + alpha
+        upper = {t: float(member.energy_price[t]) + (1-beta)*member.import_tariff + alpha + delta
                  for t in self.T}
         self.internal_prices = self.model.addVars(
             self.T, lb=lower, ub=upper, name='internal_price')
@@ -871,7 +880,11 @@ class CommunityModel:
                 internal_prices=prices,
                 mip_gap=float(self.model.MIPGap) if self.config.model_type == 'DP' else None,
                 solver_status=int(self.model.Status), budget_balance=self.config.budget_balance,
-                individual_rationality=self.config.individual_rationality)
+                individual_rationality=self.config.individual_rationality,
+                price_bound_extension=self.price_bound_extension,
+                best_bound_DKK=(float(self.model.ObjBound)
+                                if self.config.model_type == 'DP'
+                                and np.isfinite(self.model.ObjBound) else None))
         total = sum(r.objective_DKK for r in results.values())
         if not np.isclose(total, self.model.ObjVal, atol=1e-5):
             raise RuntimeError(f'Member costs ({total}) differ from model objective ({self.model.ObjVal})')
