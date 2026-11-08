@@ -19,9 +19,11 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
+import gurobipy as gp
+from gurobipy import GRB
 
 from src.data_loader import load_community, list_communities, with_contract
-from src.model import solve_community, reference_exceedance_range
+from src.model import CommunityModel, solve_community, reference_exceedance_range
 from src.analysis import (
     analyse_reference,
     analyse_individual_contracts,
@@ -127,13 +129,16 @@ def run_base_case(
 
 
 def run_dp_cap_only(community, output_dir, *, verbose=False, budget_balance=False,
-                    individual_rationality=False):
+                    individual_rationality=False, price_bound_extension: float = 0.0):
     """Solve each of DP/R/I/C once and report the deterministic Q2 experiment.
 
     output_dir is the DP directory; Q1 runners and their exports
     are separate. IR optionally adds participation constraints against Model R to BB.
     """
     started = time.perf_counter()
+    price_bound_extension = float(price_bound_extension)
+    if not np.isfinite(price_bound_extension) or price_bound_extension < 0:
+        raise ValueError('Price bound extension must be finite and non-negative')
     if individual_rationality and not budget_balance:
         raise ValueError('Individual rationality requires Budget Balance')
     results = {}
@@ -143,6 +148,8 @@ def run_dp_cap_only(community, output_dir, *, verbose=False, budget_balance=Fals
     for kind in ('R', 'I', 'C', 'DP'):
         print(f'\nSolving Model {kind} for DP {variant}...', flush=True)
         options = {'budget_balance': True} if kind == 'DP' and budget_balance else {}
+        if kind == 'DP':
+            options['price_bound_extension'] = price_bound_extension
         if kind == 'DP' and individual_rationality:
             options.update(individual_rationality=True, reference_costs_DKK={
                 cid: result.objective_DKK for cid, result in results['R'].items()})
@@ -174,6 +181,213 @@ def run_dp_cap_only(community, output_dir, *, verbose=False, budget_balance=Fals
     print(f"Accounting residual: {s['accounting_identity_residual_DKK']:.3g} DKK; validation: PASS")
     print(f'DP results saved to {output_path} ({time.perf_counter() - started:.1f} s)')
     return analysis
+
+
+def diagnose_bb_ir_feasibility(community, reference_results, *, price_bound_extension: float = 0.0):
+    """Check the unchanged BB + IR constraints; print results without exporting.
+
+    The objective/search overrides apply only to this disposable diagnostic
+    model. Financial checks use actual prices and schedules, not KKT dual bills.
+    """
+    reference_costs = {cid: result.objective_DKK for cid, result in reference_results.items()}
+    optimization = CommunityModel(
+        community, model_type='DP', budget_balance=True, individual_rationality=True,
+        reference_costs_DKK=reference_costs, verbose=True,
+        price_bound_extension=price_bound_extension)
+    model = optimization.model
+    try:
+        optimization.build()
+        model.update()
+        original_objective = model.getObjective()
+        # Diagnostic-only override: the standard community objective is unchanged.
+        model.setObjective(0.0, GRB.MINIMIZE)
+        model.Params.TimeLimit = 300
+        model.Params.MIPFocus = 1
+        model.Params.SolutionLimit = 1
+        model.Params.OutputFlag = 1
+        model.optimize()
+        names = {GRB.OPTIMAL: 'OPTIMAL', GRB.INFEASIBLE: 'INFEASIBLE',
+                 GRB.TIME_LIMIT: 'TIME_LIMIT', GRB.SOLUTION_LIMIT: 'SOLUTION_LIMIT',
+                 GRB.INTERRUPTED: 'INTERRUPTED', GRB.INF_OR_UNBD: 'INF_OR_UNBD'}
+        report = dict(solver_status=model.Status,
+                      solver_status_name=names.get(model.Status, f'STATUS_{model.Status}'),
+                      solution_count=model.SolCount, runtime_seconds=model.Runtime)
+        print('\n=== DP + BB + IR FEASIBILITY DIAGNOSTIC ===')
+        print(f"Solver status: {report['solver_status_name']} ({model.Status})")
+        print(f'Feasible solutions found: {model.SolCount}')
+        print(f'Runtime [s]: {model.Runtime:.3f}')
+        if model.SolCount > 0:
+            tolerance = 1e-5  # Absolute DKK/kW tolerances; one-hour intervals.
+            payments, local_cost, violations = 0.0, 0.0, {}
+            for cid, block in optimization.blocks.items():
+                payment = sum(optimization.internal_prices[t].X * block.net_exchange[t].getValue()
+                              for t in optimization.T)
+                local = block.physical_cost.getValue() + block.disutility_cost.getValue()
+                payments += payment
+                local_cost += local
+                violations[cid] = max(0.0, payment + local - reference_costs[cid])
+            actual_cost = original_objective.getValue()  # Diagnostic ObjVal is zero.
+            external = (optimization.objective_components['procurement'].getValue()
+                        + optimization.objective_components['penalty'].getValue())
+            bb_residual = payments - external
+            objective_residual = actual_cost - external - local_cost
+            maximum_ir = max(violations.values(), default=0.0)
+            violating = [cid for cid, value in violations.items() if value > tolerance]
+            passed = bool(np.all(np.isfinite([actual_cost, external, payments, local_cost,
+                                             *violations.values()]))
+                          and abs(bb_residual) <= tolerance and maximum_ir <= tolerance
+                          and abs(objective_residual) <= tolerance)
+            report.update(actual_community_cost_DKK=actual_cost, external_bill_DKK=external,
+                          total_payments_DKK=payments, bb_residual_DKK=bb_residual,
+                          objective_residual_DKK=objective_residual,
+                          maximum_ir_violation_DKK=maximum_ir,
+                          sum_ir_violations_DKK=sum(violations.values()),
+                          violating_member_count=len(violating), violating_members=violating,
+                          validation_passed=passed)
+            print(f'Actual community cost [DKK]: {actual_cost:.9f}')
+            print(f'BB residual [DKK]: {bb_residual:.9g}')
+            print(f'Maximum / sum of positive IR violations [DKK]: {maximum_ir:.9g} / {sum(violations.values()):.9g}')
+            print(f'IR-violating members: {len(violating)}; IDs: {", ".join(violating) or "none"}')
+            print(f'Community objective reconstruction residual [DKK]: {objective_residual:.9g}')
+            report['feasibility_conclusion'] = 'validated feasible' if passed else 'candidate failed validation'
+        elif model.Status == GRB.INFEASIBLE:
+            report['feasibility_conclusion'] = 'proven infeasible within solver tolerances'
+        else:
+            report['feasibility_conclusion'] = 'unresolved; no incumbent, infeasibility not proven'
+        print(f"Feasibility conclusion: {report['feasibility_conclusion']}")
+        if model.SolCount > 0 and not report['validation_passed']:
+            raise ValueError('Feasibility candidate failed independent BB/IR/cost validation')
+        return report
+    finally:
+        model.dispose()
+
+
+def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension: float = 0.0):
+    """Minimize IR violations in an isolated diagnostic with hard BB intact."""
+    reference_costs = {cid: float(result.objective_DKK) for cid, result in reference_results.items()}
+    if set(reference_costs) != set(community.member_ids):
+        raise ValueError('Reference costs must match all community members')
+    if not all(np.isfinite(value) for value in reference_costs.values()):
+        raise ValueError('Model R reference costs must be finite')
+    optimization = CommunityModel(
+        community, model_type='DP', budget_balance=True, individual_rationality=False,
+        verbose=True, price_bound_extension=price_bound_extension)
+    model = optimization.model
+    try:
+        optimization.build()
+        model.update()
+        original_objective = model.getObjective()
+        member_ids = list(optimization.blocks)
+        slacks = model.addVars(member_ids, lb=0.0, name='ir_slack')
+        for cid in member_ids:
+            model.addConstr(optimization.follower_dual_objectives[cid]
+                            <= reference_costs[cid] + slacks[cid], name=f'ir_relaxed_{cid}')
+        # Diagnostic only: the ordinary community-cost objective is unchanged.
+        model.setObjective(gp.quicksum(slacks[cid] for cid in member_ids), GRB.MINIMIZE)
+        model.Params.TimeLimit = 300
+        model.Params.MIPFocus = 1
+        model.Params.OutputFlag = 1
+        model.optimize()  # Keep the default SolutionLimit; improve the slack objective.
+        names = {GRB.OPTIMAL: 'OPTIMAL', GRB.INFEASIBLE: 'INFEASIBLE',
+                 GRB.TIME_LIMIT: 'TIME_LIMIT', GRB.SOLUTION_LIMIT: 'SOLUTION_LIMIT',
+                 GRB.INTERRUPTED: 'INTERRUPTED', GRB.INF_OR_UNBD: 'INF_OR_UNBD',
+                 GRB.UNBOUNDED: 'UNBOUNDED'}
+        try:
+            bound = float(model.ObjBound)
+            if not np.isfinite(bound):
+                bound = None
+        except (gp.GurobiError, AttributeError):
+            bound = None
+        report = dict(solver_status=model.Status,
+                      solver_status_name=names.get(model.Status, f'STATUS_{model.Status}'),
+                      solution_count=model.SolCount, runtime_seconds=model.Runtime,
+                      best_bound_DKK=bound)
+        print('\n=== DP + BB IR-SLACK DIAGNOSTIC ===')
+        print(f"Solver status: {report['solver_status_name']} ({model.Status})")
+        print(f'Runtime [s]: {model.Runtime:.3f}')
+        print(f'SolCount: {model.SolCount}')
+        print(f'Best bound [DKK]: {bound if bound is not None else "unavailable"}')
+        if model.SolCount > 0:
+            tolerance = 1e-5  # Absolute DKK tolerance, with one-hour intervals.
+            rows, payments, local_cost = [], 0.0, 0.0
+            for cid, block in optimization.blocks.items():
+                payment = sum(optimization.internal_prices[t].X * block.net_exchange[t].getValue()
+                              for t in optimization.T)
+                local = block.physical_cost.getValue() + block.disutility_cost.getValue()
+                settled = payment + local
+                rows.append(dict(consumer_id=cid, reference_cost_DKK=reference_costs[cid],
+                                 settled_cost_DKK=settled,
+                                 ir_violation_DKK=max(0.0, settled - reference_costs[cid]),
+                                 slack_DKK=float(slacks[cid].X)))
+                payments += payment
+                local_cost += local
+            rows.sort(key=lambda row: row['ir_violation_DKK'], reverse=True)
+            best_slack = float(model.ObjVal)  # Total slack, NOT community cost.
+            total_slack = sum(row['slack_DKK'] for row in rows)
+            actual_violation = sum(row['ir_violation_DKK'] for row in rows)
+            maximum_ir = max((row['ir_violation_DKK'] for row in rows), default=0.0)
+            external = (optimization.objective_components['procurement'].getValue()
+                        + optimization.objective_components['penalty'].getValue())
+            actual_cost = original_objective.getValue()
+            bb_residual = payments - external
+            cost_residual = actual_cost - external - local_cost
+            slack_residual = actual_violation - total_slack
+            gap = float(model.MIPGap)
+            passed = bool(np.all(np.isfinite([best_slack, actual_cost, external, payments, local_cost,
+                                             *(value for row in rows for key, value in row.items()
+                                               if key != 'consumer_id')]))
+                          and all(row['slack_DKK'] >= -tolerance
+                                  and row['ir_violation_DKK'] <= row['slack_DKK'] + tolerance
+                                  for row in rows)
+                          and abs(best_slack - total_slack) <= tolerance
+                          and abs(slack_residual) <= tolerance
+                          and abs(bb_residual) <= tolerance and abs(cost_residual) <= tolerance)
+            report.update(best_total_ir_slack_DKK=best_slack,
+                          mip_gap=gap if np.isfinite(gap) else None,
+                          actual_community_cost_DKK=actual_cost, external_bill_DKK=external,
+                          total_payments_DKK=payments, bb_residual_DKK=bb_residual,
+                          maximum_ir_violation_DKK=maximum_ir,
+                          actual_total_ir_violation_DKK=actual_violation,
+                          slack_reconstruction_residual_DKK=slack_residual,
+                          objective_residual_DKK=cost_residual,
+                          violating_member_count=sum(row['ir_violation_DKK'] > tolerance for row in rows),
+                          members=rows, validation_passed=passed)
+            print(f'Best total IR slack [DKK]: {best_slack:.9f}')
+            print(f'MIP gap: {gap:.6%}' if np.isfinite(gap) else 'MIP gap: unavailable')
+            print(f'Actual community cost [DKK]: {actual_cost:.9f}')
+            print(f'BB residual [DKK]: {bb_residual:.9g}')
+            print(f'Maximum / total actual IR violation [DKK]: {maximum_ir:.9g} / {actual_violation:.9g}')
+            print(f'Actual violation minus total slack [DKK]: {slack_residual:.9g}')
+            print(f'Community-cost reconstruction residual [DKK]: {cost_residual:.9g}')
+            print(f'{"Member":<16} {"R cost":>12} {"DP cost":>12} {"IR violation":>14} {"IR slack":>12}  [DKK]')
+            for row in rows:
+                print(f"{row['consumer_id']:<16} {row['reference_cost_DKK']:>12.6f} "
+                      f"{row['settled_cost_DKK']:>12.6f} {row['ir_violation_DKK']:>14.6f} "
+                      f"{row['slack_DKK']:>12.6f}")
+            print(f'Validation: {"PASS" if passed else "FAIL"}')
+            if not passed:
+                conclusion = 'candidate failed independent validation; no validated feasibility conclusion'
+            elif total_slack <= tolerance:
+                conclusion = 'BB + IR is feasible within numerical tolerances'
+            elif model.Status == GRB.OPTIMAL:
+                conclusion = 'positive optimal total IR slack; hard BB + IR is infeasible within solver tolerances'
+            elif bound is not None and bound > tolerance:
+                conclusion = 'positive lower bound rules out zero total IR slack under the current assumptions'
+            else:
+                conclusion = 'positive-slack incumbent is only an upper bound; minimum IR relaxation remains unresolved'
+        elif model.Status == GRB.INFEASIBLE:
+            conclusion = 'relaxed diagnostic proven infeasible; the difficulty is not solely hard IR'
+            print('No feasible diagnostic incumbent was found.')
+        else:
+            conclusion = 'no feasible diagnostic incumbent; minimum IR relaxation remains unresolved'
+            print('No feasible diagnostic incumbent was found.')
+        report['feasibility_conclusion'] = conclusion
+        print(f'Conclusion: {conclusion}')
+        if model.SolCount > 0 and not report['validation_passed']:
+            raise ValueError('IR-slack candidate failed independent slack/BB/cost validation')
+        return report
+    finally:
+        model.dispose()
 
 
 def refine_crossings(points, evaluate, tolerance=.005):
@@ -326,8 +540,15 @@ def main() -> None:
                     help="R, I, C, DP (Q2 Cap Only), both (R+I), all (R+I+C), or none")
     ap.add_argument("--verbose-solver", action="store_true", help="Show Gurobi solver output")
     ap.add_argument("--budget-balance", action="store_true", help="Enforce budget balance (requires --model DP)")
+    ap.add_argument("--price-bound-extension", type=float, default=0.0,
+                    help="Symmetric extension of DP internal price bounds in DKK/kWh")
     ap.add_argument("--individual-rationality", action="store_true",
                     help="Enforce individual rationality for DP + Budget Balance")
+    diagnostics = ap.add_mutually_exclusive_group()
+    diagnostics.add_argument("--feasibility-check", action="store_true",
+                             help="Run feasibility-only diagnosis for DP + BB + IR")
+    diagnostics.add_argument("--ir-slack-check", action="store_true",
+                             help="Minimize individual rationality violations under hard Budget Balance")
     ap.add_argument("--settlement", action="store_true",
                     help="Calculate member benefits and manager budget (requires --model all)")
     ap.add_argument("--sensitivity", choices=["discount", "cap", "both"],
@@ -340,6 +561,14 @@ def main() -> None:
     ap.add_argument("--reference-diagnostics", action="store_true",
                     help="Certify R's exceedance range across alternative economic optima")
     args = ap.parse_args()
+    if not np.isfinite(args.price_bound_extension) or args.price_bound_extension < 0:
+        ap.error('--price-bound-extension must be finite and non-negative')
+    if args.price_bound_extension != 0 and args.model != 'DP':
+        ap.error('Nonzero --price-bound-extension requires --model DP')
+    if args.feasibility_check and (args.model != 'DP' or not args.budget_balance or not args.individual_rationality):
+        ap.error('--feasibility-check requires --model DP --budget-balance --individual-rationality')
+    if args.ir_slack_check and (args.model != 'DP' or not args.budget_balance or not args.individual_rationality):
+        ap.error('--ir-slack-check requires --model DP --budget-balance --individual-rationality')
     if args.budget_balance and args.model != 'DP':
         ap.error('--budget-balance requires --model DP')
     if args.individual_rationality and (args.model != 'DP' or not args.budget_balance):
@@ -365,9 +594,17 @@ def main() -> None:
     if args.members:
         for member in community.members:
             print(member.summary(), "\n")
+    if args.feasibility_check or args.ir_slack_check:
+        reference = solve_community(community, model_type='R', verbose=args.verbose_solver)
+        if args.ir_slack_check:
+            diagnose_bb_ir_slacks(community, reference, price_bound_extension=args.price_bound_extension)
+        else:
+            diagnose_bb_ir_feasibility(community, reference, price_bound_extension=args.price_bound_extension)
+        return
     if args.model == "DP":
         run_dp_cap_only(community, output_dir / "DP", verbose=args.verbose_solver,
-                        budget_balance=args.budget_balance, individual_rationality=args.individual_rationality)
+                        budget_balance=args.budget_balance, individual_rationality=args.individual_rationality,
+                        price_bound_extension=args.price_bound_extension)
     else:
         run_base_case(community, output_dir, model=args.model, settlement=args.settlement,
                       reference_diagnostics=args.reference_diagnostics, verbose=args.verbose_solver)

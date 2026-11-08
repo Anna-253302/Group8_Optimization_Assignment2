@@ -950,8 +950,11 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
     alpha = scalar(community.contract.penalty_DKK_per_kWh, 'penalty')
     buy = price + discount * community.import_tariff
     sell = price - discount * community.export_tariff
-    if np.any(internal < sell - tolerance) or np.any(internal > buy + alpha + tolerance):
-        raise ValueError('DP internal prices violate Cap-Only price bounds')
+    delta = scalar(dp.price_bound_extension, 'price bound extension')
+    if delta < 0:
+        raise ValueError('Price bound extension must be non-negative')
+    if np.any(internal < sell - delta - tolerance) or np.any(internal > buy + alpha + delta + tolerance):
+        raise ValueError('DP internal prices violate configured price bounds')
     objectives = {
         'R': sum(scalar(reference[cid].objective_DKK, f'R/{cid} cost') for cid in ids),
         'I': sum(scalar(individual[cid].objective_DKK, f'I/{cid} cost') for cid in ids),
@@ -1087,6 +1090,11 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
     if dp.budget_balance:
         summary.update(budget_balance_enforced=True, budget_balance_validation_passed=True,
                        interpretation_note='Optimistic follower responses may be nonunique. Equal community costs do not imply equal prices or schedules. BB is enforced; IR remains diagnostic. No surplus is redistributed.')
+    if delta != 0:
+        summary['price_bound_extension_DKK_per_kWh'] = delta
+    if dp.best_bound_DKK is not None:
+        bound = float(dp.best_bound_DKK)
+        summary['best_bound_DKK'] = bound if np.isfinite(bound) else None
     if dp.individual_rationality:
         summary.update(individual_rationality_enforced=True, individual_rationality_validation_passed=True,
                        worse_off_vs_R_count=len(summary['worse_off_vs_R']),
@@ -1113,6 +1121,12 @@ def export_dp_analysis(analysis, output_dir):
                    hourly=analysis.hourly, members=analysis.members)
     content = json.dumps(payload, indent=2, allow_nan=False) + '\n'
     output_dir = Path(output_dir)
+    delta = float(analysis.summary.get('price_bound_extension_DKK_per_kWh', 0.0))
+    if not np.isfinite(delta) or delta < 0:
+        raise ValueError('Price bound extension must be finite and non-negative')
+    if delta != 0:
+        label = str(delta).removesuffix('.0').replace('.', 'p')
+        output_dir = output_dir / 'price_bound_sensitivity' / f'delta_{label}'
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = analysis.summary['model_variant'].removeprefix('DP_') + '.json'
     output_path = output_dir / filename
