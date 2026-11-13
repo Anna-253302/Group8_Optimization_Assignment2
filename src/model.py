@@ -514,6 +514,92 @@ def solve_reference_member(
         verbose=verbose,
     )
 
+def solve_fixed_price_member(
+    member: InputData,
+    prices: np.ndarray,
+    *,
+    terminal_soc: str = "cyclic",
+    verbose: bool = False,
+) -> ReferenceResult:
+    """Solve one consumer's optimal response to fixed internal electricity prices."""
+
+    prices = np.asarray(prices, dtype=float)
+
+    if prices.shape != (member.n_hours,):
+        raise ValueError("Prices must match the hourly horizon")
+    if not np.all(np.isfinite(prices)):
+        raise ValueError("Prices must be finite")
+
+    model = gp.Model(f"FixedPrice_{member.consumer_id}")
+    model.Params.OutputFlag = int(verbose)
+
+    block = add_consumer_constraints(
+        model,
+        member,
+        terminal_soc=terminal_soc,
+    )
+
+    T = range(member.n_hours)
+
+    if member.max_import_kW is not None:
+        model.addConstrs(
+            (block.net_exchange[t] <= member.max_import_kW for t in T),
+            name="physical_import_limit",
+        )
+
+    if member.max_export_kW is not None:
+        model.addConstrs(
+            (block.net_exchange[t] >= -member.max_export_kW for t in T),
+            name="physical_export_limit",
+        )
+
+    payment = gp.quicksum(
+        float(prices[t]) * block.net_exchange[t]
+        for t in T
+    )
+
+    model.setObjective(
+        payment + block.physical_cost + block.disutility_cost,
+        GRB.MINIMIZE,
+    )
+
+    model.optimize()
+
+    if model.Status != GRB.OPTIMAL:
+        raise RuntimeError(
+            f"Fixed-price consumer {member.consumer_id}: "
+            f"Gurobi status {model.Status}"
+        )
+
+    v = block.variables
+
+    def arr(values):
+        return np.array([values[t].X for t in T], dtype=float)
+
+    net = np.array(
+        [block.net_exchange[t].getValue() for t in T],
+        dtype=float,
+    )
+
+    soc = (
+        np.array([v["soc"][t].X for t in range(member.n_hours + 1)])
+        if member.has_battery
+        else None
+    )
+
+    return ReferenceResult(
+        consumer_id=member.consumer_id,
+        objective_DKK=float(model.ObjVal),
+        load_kW=arr(v["load"]),
+        pv_kW=arr(v["pv"]),
+        import_kW=np.maximum(net, 0.0),
+        export_kW=np.maximum(-net, 0.0),
+        net_exchange_kW=net,
+        deviation_kW=arr(v["deviation"]),
+        soc_kWh=soc,
+        charge_kW=arr(v["charge"]) if member.has_battery else None,
+        discharge_kW=arr(v["discharge"]) if member.has_battery else None,
+    )
 
 def solve_reference(community: CommunityData, *, terminal_soc: str = 'cyclic',
                     verbose: bool = False) -> dict[str, ReferenceResult]:

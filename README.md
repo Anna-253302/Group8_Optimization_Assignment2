@@ -299,6 +299,38 @@ early-termination reporting and exports. Run them with
 `python -m unittest discover -s tests -v`, and run the Q1 regression with
 `python main.py --model all --day d1 --settlement`.
 
+### 1.7 Question 3: Fixed-Price Evaluation Under Preference Uncertainty
+
+After generating the deterministic Q2 Cap Only prices, evaluate member responses
+to those same prices under uncertain reference-load profiles:
+
+```bash
+python main.py --model DP --day d1
+python main.py --q3-evaluate --day d1 --q3-scenario-count 5 --q3-seed 1
+```
+
+The second command reads the saved DP prices; it does not solve DP again. It
+generates equiprobable joint preference scenarios using the selected day's
+reference profile and uncertainty rules, then solves one independent fixed-price
+LP per member and scenario. Only the reference profile is uncertain; the
+disutility coefficient remains at its baseline value. A scenario count of one
+intentionally means the unperturbed baseline (`theta = 1`), not a random draw.
+Any positive scenario count is supported, including 1, 5, 10 and 100.
+
+The evaluator checks member load, energy, PV, battery, SOC and individual
+connection constraints, reconstructs member objectives, and reports scenario
+community costs and capacity exceedance at the single netted community meter.
+Scenario-weighted objective and capacity-exceedance summaries are also included.
+Results are written to
+results/<community>/<day>/Q3/fixed_price/<experiment>/results.json; this includes
+member schedules and metrics for reuse. The reusable evaluation function in
+`src/analysis.py` performs no file I/O and accepts any fixed price vector,
+including prices supplied by later stochastic models. This evaluates fixed
+prices only; it does not implement stochastic bilevel optimization. Consumer
+LPs can have multiple optimal schedules, so the independently selected
+responses (and their aggregate cap outcome) may differ from the deterministic
+DP dispatch even when individual member objectives match.
+
 ## 2. Repository structure
 
 The same division of responsibilities as Assignment 1 is used. Experiment
