@@ -12,13 +12,17 @@ import csv
 import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 from gurobipy import GRB
 
-from .data_loader import CommunityData
-from .model import ReferenceResult, CommunityResult
+from .data_loader import CommunityData, InputData
+from .model import (
+    ReferenceResult,
+    CommunityResult,
+    solve_fixed_price_member,
+)
 
 
 @dataclass
@@ -1201,3 +1205,423 @@ def export_contract_sensitivity(rows, members, report, output_dir):
     _write_csv(output_dir / "member_benefits.csv", members)
     (output_dir / "study.json").write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def _fixed_price_member_metrics(
+    member: InputData,
+    result: ReferenceResult,
+    prices: np.ndarray,
+    scenario_id: object,
+    *,
+    tolerance: float,
+    objective_tolerance: float,
+) -> dict:
+    """Validate one fixed-price response and calculate its daily metrics."""
+    cid = member.consumer_id
+    n = member.n_hours
+
+    def hourly(values, label):
+        array = np.asarray(values, dtype=float)
+        if array.shape != (n,) or not np.all(np.isfinite(array)):
+            raise ValueError(
+                f"Scenario {scenario_id}, consumer {cid}: {label} must contain "
+                f"{n} finite hourly values"
+            )
+        return array
+
+    if result.consumer_id != cid:
+        raise ValueError(
+            f"Scenario {scenario_id}, consumer {cid}: result ID is "
+            f"{result.consumer_id!r}"
+        )
+
+    if member.reference_load is None or member.min_daily_energy_kWh is None:
+        raise ValueError(
+            f"Scenario {scenario_id}, consumer {cid}: reference profile and "
+            "minimum daily energy are required"
+        )
+    if member.load_lower_kWh is None or member.load_upper_kWh is None:
+        raise ValueError(
+            f"Scenario {scenario_id}, consumer {cid}: hourly load bounds are required"
+        )
+    if member.linear_disutility is None:
+        raise ValueError(
+            f"Scenario {scenario_id}, consumer {cid}: linear disutility is required"
+        )
+
+    load = hourly(result.load_kW, "load")
+    pv = hourly(result.pv_kW, "PV generation")
+    net = hourly(result.net_exchange_kW, "net exchange")
+    imports = hourly(result.import_kW, "member import")
+    exports = hourly(result.export_kW, "member export")
+    deviation = hourly(result.deviation_kW, "load deviation")
+    reference = hourly(member.reference_load, "reference load")
+    lower = hourly(member.load_lower_kWh, "load lower bound")
+    upper = hourly(member.load_upper_kWh, "load upper bound")
+    pv_available = hourly(member.pv_available, "PV availability")
+
+    if member.has_battery:
+        if result.soc_kWh is None or result.charge_kW is None or result.discharge_kW is None:
+            raise ValueError(
+                f"Scenario {scenario_id}, consumer {cid}: battery response is incomplete"
+            )
+        soc = np.asarray(result.soc_kWh, dtype=float)
+        if soc.shape != (n + 1,) or not np.all(np.isfinite(soc)):
+            raise ValueError(
+                f"Scenario {scenario_id}, consumer {cid}: battery SOC must contain "
+                f"{n + 1} finite values"
+            )
+        charge = hourly(result.charge_kW, "battery charging")
+        discharge = hourly(result.discharge_kW, "battery discharging")
+    else:
+        soc = None
+        charge = np.zeros(n)
+        discharge = np.zeros(n)
+
+    violations: dict[str, float] = {}
+
+    def record(label, amount):
+        value = float(np.max(np.maximum(np.asarray(amount, dtype=float), 0.0)))
+        violations[label] = value
+
+    record("hourly load lower bound", lower - load)
+    record("hourly load upper bound", load - upper)
+    record(
+        "minimum daily energy",
+        [float(member.min_daily_energy_kWh) - float(np.sum(load))],
+    )
+    record("nonnegative PV generation", -pv)
+    record("PV availability", pv - pv_available)
+    record("absolute load deviation", np.abs(deviation - np.abs(load - reference)))
+    record("nonnegative deviation", -deviation)
+    record("member import", -imports)
+    record("member export", -exports)
+    record("member net-exchange balance", np.abs(net - (load + charge - pv - discharge)))
+    record("member import/export balance", np.abs(net - (imports - exports)))
+    if member.max_import_kW is not None:
+        record("individual import connection limit", net - member.max_import_kW)
+    if member.max_export_kW is not None:
+        record("individual export connection limit", -member.max_export_kW - net)
+
+    if member.has_battery:
+        capacity = float(member.battery_capacity_kWh)
+        record("battery state-of-charge lower bound", -soc)
+        record("battery state-of-charge upper bound", soc - capacity)
+        record("battery charging lower bound", -charge)
+        record(
+            "battery charging upper bound",
+            charge - float(member.battery_max_charge_kW),
+        )
+        record("battery discharging lower bound", -discharge)
+        record(
+            "battery discharging upper bound",
+            discharge - float(member.battery_max_discharge_kW),
+        )
+        record(
+            "initial battery state of charge",
+            [abs(float(soc[0]) - float(member.battery_initial_soc_kWh))],
+        )
+        expected_soc = (
+            soc[:-1]
+            + float(member.battery_charging_efficiency) * charge
+            - discharge / float(member.battery_discharging_efficiency)
+        )
+        record("battery state-of-charge dynamics", np.abs(soc[1:] - expected_soc))
+        record("cyclic terminal state of charge", [abs(float(soc[-1] - soc[0]))])
+
+    max_violation_name, max_violation = max(violations.items(), key=lambda item: item[1])
+    if max_violation > tolerance:
+        raise ValueError(
+            f"Scenario {scenario_id}, consumer {cid}: {max_violation_name} "
+            f"violation {max_violation:.6g} exceeds tolerance {tolerance:g}"
+        )
+
+    dt_hours = 1.0
+    reference_energy = float(np.sum(reference) * dt_hours)
+    actual_energy = float(np.sum(load) * dt_hours)
+    absolute_deviation = float(np.sum(np.abs(load - reference)) * dt_hours)
+    net_energy = float(np.sum(net) * dt_hours)
+    pv_energy = float(np.sum(pv) * dt_hours)
+    charging_energy = float(np.sum(charge) * dt_hours)
+    discharging_energy = float(np.sum(discharge) * dt_hours)
+
+    internal_payment = float(np.dot(prices, net) * dt_hours)
+    pv_cost = float(member.pv_marginal_cost * pv_energy)
+    disutility_cost = float(member.linear_disutility * absolute_deviation)
+    objective = internal_payment + pv_cost + disutility_cost
+    if not np.isclose(
+        objective,
+        float(result.objective_DKK),
+        atol=objective_tolerance,
+        rtol=0,
+    ):
+        raise ValueError(
+            f"Scenario {scenario_id}, consumer {cid}: independently calculated "
+            f"objective {objective:.9f} DKK does not match LP objective "
+            f"{float(result.objective_DKK):.9f} DKK"
+        )
+
+    return {
+        "consumer_id": cid,
+        "daily_reference_energy_kWh": reference_energy,
+        "daily_actual_consumption_kWh": actual_energy,
+        "total_absolute_load_deviation_kWh": absolute_deviation,
+        "daily_net_electricity_exchange_kWh": net_energy,
+        "peak_member_import_kW": float(np.max(imports)),
+        "total_pv_generation_kWh": pv_energy,
+        "total_battery_charging_kWh": charging_energy,
+        "total_battery_discharging_kWh": discharging_energy,
+        "internal_electricity_payment_DKK": internal_payment,
+        "pv_production_cost_DKK": pv_cost,
+        "disutility_cost_DKK": disutility_cost,
+        "total_member_objective_DKK": objective,
+        "maximum_constraint_violation": max_violation,
+        "maximum_constraint_violation_name": max_violation_name,
+    }
+
+
+def evaluate_fixed_prices_under_uncertainty(
+    community: CommunityData,
+    prices: np.ndarray,
+    scenarios: Sequence[Mapping],
+    *,
+    tolerance: float = 1e-6,
+    objective_tolerance: float = 1e-5,
+) -> dict:
+    """Evaluate independent consumer responses and community outcomes at fixed prices.
+
+    Scenarios contain ``id``, ``probability``, and ``members`` (an iterable or
+    consumer-ID mapping of scenario-specific :class:`InputData`). Prices are
+    not optimized here. The community meter nets member exchanges before
+    calculating imports, exports, tariffs, and capacity exceedance.
+    """
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("Constraint tolerance must be finite and positive")
+    if not np.isfinite(objective_tolerance) or objective_tolerance <= 0:
+        raise ValueError("Objective tolerance must be finite and positive")
+    if not community.members:
+        raise ValueError("Community must contain at least one member")
+
+    community_ids = [member.consumer_id for member in community.members]
+    if len(community_ids) != len(set(community_ids)):
+        raise ValueError("Community consumer IDs must be unique")
+    n = community.members[0].n_hours
+    if any(member.n_hours != n for member in community.members):
+        raise ValueError("All community members must have the same hourly horizon")
+
+    prices = np.asarray(prices, dtype=float)
+    if prices.shape != (n,):
+        raise ValueError(f"Prices must contain exactly {n} hourly values")
+    if not np.all(np.isfinite(prices)):
+        raise ValueError("Prices must be finite")
+
+    try:
+        scenario_list = list(scenarios)
+    except TypeError as exc:
+        raise ValueError("At least one scenario must be supplied") from exc
+    if not scenario_list:
+        raise ValueError("At least one scenario must be supplied")
+
+    prepared = []
+    scenario_ids = set()
+    probabilities = []
+    expected_ids = set(community_ids)
+    for index, scenario in enumerate(scenario_list):
+        if not isinstance(scenario, Mapping):
+            raise ValueError(f"Scenario {index} must be a mapping")
+        scenario_id = scenario.get("id", index)
+        try:
+            if scenario_id in scenario_ids:
+                raise ValueError(f"Duplicate scenario ID {scenario_id!r}")
+            scenario_ids.add(scenario_id)
+        except TypeError as exc:
+            raise ValueError(f"Scenario {index} ID must be hashable") from exc
+
+        probability = float(scenario.get("probability", np.nan))
+        if not np.isfinite(probability) or probability < 0:
+            raise ValueError(
+                f"Scenario {scenario_id}: probability must be finite and nonnegative"
+            )
+        probabilities.append(probability)
+
+        scenario_members = scenario.get("members")
+        if isinstance(scenario_members, Mapping):
+            member_values = list(scenario_members.values())
+            mapping_ids = set(scenario_members)
+        else:
+            try:
+                member_values = list(scenario_members)
+            except TypeError as exc:
+                raise ValueError(
+                    f"Scenario {scenario_id}: members must be an iterable or mapping"
+                ) from exc
+            mapping_ids = None
+        if any(not isinstance(member, InputData) for member in member_values):
+            raise ValueError(
+                f"Scenario {scenario_id}: every member must be an InputData object"
+            )
+        member_ids = [member.consumer_id for member in member_values]
+        if len(member_ids) != len(set(member_ids)):
+            raise ValueError(f"Scenario {scenario_id}: consumer IDs must be unique")
+        if set(member_ids) != expected_ids:
+            raise ValueError(
+                f"Scenario {scenario_id}: members do not match the community; "
+                f"missing={expected_ids - set(member_ids)}, "
+                f"extra={set(member_ids) - expected_ids}"
+            )
+        if mapping_ids is not None and mapping_ids != expected_ids:
+            raise ValueError(
+                f"Scenario {scenario_id}: member mapping keys must match consumer IDs"
+            )
+        if any(member.n_hours != n for member in member_values):
+            raise ValueError(
+                f"Scenario {scenario_id}: all members must have the community's "
+                f"{n}-hour horizon"
+            )
+        by_id = {member.consumer_id: member for member in member_values}
+        prepared.append((scenario, scenario_id, probability, by_id))
+
+    if not np.isclose(sum(probabilities), 1.0, atol=1e-9, rtol=0):
+        raise ValueError(
+            f"Scenario probabilities must sum to one; got {sum(probabilities):.12g}"
+        )
+
+    day_ahead_prices = np.asarray(community.energy_price, dtype=float)
+    capacity = np.asarray(community.contract.capacity_limit_kW, dtype=float)
+    if day_ahead_prices.shape != (n,) or not np.all(np.isfinite(day_ahead_prices)):
+        raise ValueError(f"Community day-ahead prices must contain {n} finite values")
+    if capacity.shape != (n,) or not np.all(np.isfinite(capacity)) or np.any(capacity < 0):
+        raise ValueError(f"Community capacity limit must contain {n} finite nonnegative values")
+
+    reference = community.members[0]
+    for member in community.members[1:]:
+        if (
+            not np.allclose(member.energy_price, reference.energy_price, rtol=0, atol=1e-12)
+            or not np.isclose(member.import_tariff, reference.import_tariff, rtol=0, atol=1e-12)
+            or not np.isclose(member.export_tariff, reference.export_tariff, rtol=0, atol=1e-12)
+        ):
+            raise ValueError("Community meter requires common prices and tariffs")
+    beta = float(community.contract.tariff_discount_ratio)
+    penalty_rate = float(community.contract.penalty_DKK_per_kWh)
+    if not np.isfinite(beta) or not np.isfinite(penalty_rate):
+        raise ValueError("Community tariff discount and penalty must be finite")
+
+    evaluated = []
+    weighted_components = {
+        "energy_market_DKK": 0.0,
+        "grid_tariffs_DKK": 0.0,
+        "pv_production_DKK": 0.0,
+        "disutility_DKK": 0.0,
+        "congestion_penalty_DKK": 0.0,
+    }
+    expected_exceedance_kWh = 0.0
+    cap_violation_probability = 0.0
+
+    for scenario, scenario_id, probability, members_by_id in prepared:
+        member_results = {}
+        member_metrics = {}
+        for cid in community_ids:
+            member = members_by_id[cid]
+            result = solve_fixed_price_member(
+                member,
+                prices,
+                terminal_soc="cyclic",
+                verbose=False,
+            )
+            member_results[cid] = result
+            member_metrics[cid] = _fixed_price_member_metrics(
+                member,
+                result,
+                prices,
+                scenario_id,
+                tolerance=tolerance,
+                objective_tolerance=objective_tolerance,
+            )
+
+        aggregate_net = np.sum(
+            [member_results[cid].net_exchange_kW for cid in community_ids],
+            axis=0,
+        )
+        community_import = np.maximum(aggregate_net, 0.0)
+        community_export = np.maximum(-aggregate_net, 0.0)
+        exceedance = np.maximum(community_import - capacity, 0.0)
+        dt_hours = 1.0
+        energy_market = float(
+            np.sum(day_ahead_prices * aggregate_net) * dt_hours
+        )
+        grid_tariffs = float(
+            (1.0 - beta)
+            * np.sum(
+                reference.import_tariff * community_import
+                + reference.export_tariff * community_export
+            )
+            * dt_hours
+        )
+        pv_cost = float(sum(
+            member_metrics[cid]["pv_production_cost_DKK"]
+            for cid in community_ids
+        ))
+        disutility = float(sum(
+            member_metrics[cid]["disutility_cost_DKK"]
+            for cid in community_ids
+        ))
+        congestion_penalty = float(np.sum(exceedance) * penalty_rate * dt_hours)
+        objective_components = {
+            "energy_market_DKK": energy_market,
+            "grid_tariffs_DKK": grid_tariffs,
+            "pv_production_DKK": pv_cost,
+            "disutility_DKK": disutility,
+            "congestion_penalty_DKK": congestion_penalty,
+        }
+        total_objective = float(sum(objective_components.values()))
+        congested = bool(np.any(exceedance > tolerance))
+        community_metrics = {
+            "community_net_exchange_kW": aggregate_net,
+            "community_import_kW": community_import,
+            "community_export_kW": community_export,
+            "capacity_limit_kW": capacity.copy(),
+            "capacity_exceedance_kW": exceedance,
+            "peak_community_import_kW": float(np.max(community_import)),
+            "maximum_capacity_exceedance_kW": float(np.max(exceedance)),
+            "capacity_exceedance_kWh": float(np.sum(exceedance) * dt_hours),
+            "congested_hours": int(np.count_nonzero(exceedance > tolerance)),
+            "capacity_satisfied": not congested,
+            "daily_import_kWh": float(np.sum(community_import) * dt_hours),
+            "daily_export_kWh": float(np.sum(community_export) * dt_hours),
+            "daily_net_import_kWh": float(np.sum(aggregate_net) * dt_hours),
+            "objective_components_DKK": objective_components,
+            "total_objective_DKK": total_objective,
+        }
+        evaluated.append({
+            "id": scenario_id,
+            "probability": probability,
+            "theta": scenario.get("theta"),
+            "member_results": member_results,
+            "members": member_metrics,
+            "community": community_metrics,
+        })
+
+        for name, value in objective_components.items():
+            weighted_components[name] += probability * value
+        expected_exceedance_kWh += probability * community_metrics["capacity_exceedance_kWh"]
+        if congested:
+            cap_violation_probability += probability
+
+    return {
+        "prices_DKK_per_kWh": prices.copy(),
+        "dt_hours": 1.0,
+        "tolerance": tolerance,
+        "objective_tolerance_DKK": objective_tolerance,
+        "scenario_count": len(evaluated),
+        "expected_objective_components_DKK": weighted_components,
+        "expected_community_objective_DKK": float(sum(weighted_components.values())),
+        "expected_capacity_exceedance_kWh": expected_exceedance_kWh,
+        "probability_of_capacity_exceedance": cap_violation_probability,
+        "interpretation_note": (
+            "Fixed-price consumer LPs can have multiple optimal schedules. "
+            "Reported community outcomes use the schedules returned by the "
+            "independent LP solves and may differ from a deterministic DP "
+            "dispatch even when member objectives match."
+        ),
+        "scenarios": evaluated,
+    }

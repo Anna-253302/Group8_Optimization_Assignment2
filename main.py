@@ -22,8 +22,8 @@ import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 
-from src.data_loader import load_community, list_communities, with_contract
-from src.model import CommunityModel, solve_community, reference_exceedance_range
+from src.data_loader import (load_community, list_communities, with_contract, with_preference_scenario)
+from src.model import (CommunityModel, solve_community, reference_exceedance_range, solve_fixed_price_member)
 from src.analysis import (
     analyse_reference,
     analyse_individual_contracts,
@@ -37,8 +37,11 @@ from src.analysis import (
     export_contract_sensitivity,
     analyse_dp,
     export_dp_analysis,
+    evaluate_fixed_prices_under_uncertainty,
 )
 from src.plotting import plot_feeder_import, plot_settlement, plot_contract_sensitivity
+from src import scenario_generation as sg
+
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
@@ -528,6 +531,290 @@ def run_contract_sensitivity(
     return reports
 
 
+def validate_fixed_price_response(community, output_dir):
+    """Validate independent consumer LPs against deterministic DP member costs."""
+
+    result_path = Path(output_dir) / "DP" / "cap_only.json"
+
+    with result_path.open(encoding="utf-8") as f:
+        dp_results = json.load(f)
+
+    hourly = sorted(dp_results["hourly"], key=lambda row: row["hour"])
+
+    prices = np.array(
+        [row["dp_internal_price_DKK_per_kWh"] for row in hourly],
+        dtype=float,
+    )
+
+    if len(prices) != 24:
+        raise ValueError("Expected 24 hourly DP prices")
+
+    dp_members = {
+        row["consumer_id"]: row
+        for row in dp_results["members"]
+    }
+
+    print("\n=== FIXED-PRICE CONSUMER RESPONSE VALIDATION ===")
+
+    max_difference = 0.0
+
+    for member in community.members:
+
+        result = solve_fixed_price_member(member, prices)
+
+        expected_cost = dp_members[member.consumer_id]["settled_cost_DP_DKK"]
+
+        difference = abs(result.objective_DKK - expected_cost)
+
+        max_difference = max(max_difference, difference)
+
+        print(
+            f"{member.consumer_id:<10} "
+            f"Independent LP: {result.objective_DKK:>10.6f} DKK | "
+            f"DP: {expected_cost:>10.6f} DKK | "
+            f"Difference: {difference:.8f} DKK"
+        )
+
+    tolerance = 1e-5
+
+    print(f"\nMaximum difference: {max_difference:.8f} DKK")
+
+    if max_difference > tolerance:
+        raise AssertionError(
+            f"Fixed-price validation failed: {max_difference:.8f} DKK"
+        )
+
+    print("Validation: PASS")
+
+def prepare_q3_scenarios(community, n=5, seed=1):
+    """Prepare day-specific profile scenarios as scenario-specific InputData.
+
+    With n=1, the scenario generator intentionally returns the unperturbed
+    baseline (theta=1), rather than drawing a random preference scenario.
+    """
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError("Scenario count must be a positive integer")
+
+    app, _ = sg.day_data(
+        community.raw["appliance_params"],
+        community.raw["bus_params"],
+        community.raw["weekly_profiles"],
+        community.day,
+    )
+    par = community.raw["params"]
+    rules = sg.load_json("preference_uncertainty_params.json")
+    scenarios = sg.draw_preference_scenarios(
+        app,
+        par,
+        rules,
+        n=n,
+        seed=seed,
+        quantities=("profile",),
+    )
+
+    prepared = []
+    for scenario in scenarios:
+        members = [
+            with_preference_scenario(member, scenario)
+            for member in community.members
+        ]
+        prepared.append({
+            "id": scenario["id"],
+            "probability": float(scenario["probability"]),
+            "theta": scenario["theta"],
+            "index": scenario["index"],
+            "members": members,
+        })
+    if not np.isclose(
+        sum(scenario["probability"] for scenario in prepared),
+        1.0,
+        atol=1e-9,
+        rtol=0,
+    ):
+        raise ValueError("Generated preference scenario probabilities must sum to one")
+    return prepared
+
+
+def run_q3_fixed_price_evaluation(community, output_dir, *, n=5, seed=1):
+    """Evaluate prepared preference draws at the saved Q2 Cap Only prices."""
+    dp_path = Path(output_dir) / "DP" / "cap_only.json"
+    with dp_path.open(encoding="utf-8") as f:
+        dp_results = json.load(f)
+
+    hourly = sorted(dp_results["hourly"], key=lambda row: row["hour"])
+    prices = np.asarray(
+        [row["dp_internal_price_DKK_per_kWh"] for row in hourly],
+        dtype=float,
+    )
+    # Evaluate independent consumer responses without uncertainty
+    baseline_scenarios = prepare_q3_scenarios(
+        community,
+        n=1,
+        seed=seed,
+    )
+
+    baseline_evaluation = evaluate_fixed_prices_under_uncertainty(
+        community,
+        prices,
+        baseline_scenarios,
+    )
+
+    independent_baseline_objective = baseline_evaluation[
+        "expected_community_objective_DKK"
+    ]
+    scenarios = prepare_q3_scenarios(community, n=n, seed=seed)
+    evaluation = evaluate_fixed_prices_under_uncertainty(
+        community,
+        prices,
+        scenarios,
+    )
+
+    # Deterministic optimistic DP objective
+    deterministic_dp_objective = float(
+        dp_results["summary"]["objectives_DKK"]["DP"]
+    )
+
+    # Difference between optimistic and independent consumer responses
+    implementation_difference = (
+        independent_baseline_objective
+        - deterministic_dp_objective
+    )
+
+    # Additional difference caused by uncertain preferences
+    uncertainty_difference = (
+        evaluation["expected_community_objective_DKK"]
+        - independent_baseline_objective
+    )
+    payload = {
+        "community": community.community,
+        "day": community.day,
+        "price_source": "deterministic DP Cap Only",
+        "deterministic_dp_objective_DKK": deterministic_dp_objective,
+
+        "independent_baseline_objective_DKK": (
+            independent_baseline_objective
+        ),
+
+        "implementation_difference_DKK": (
+            implementation_difference
+        ),
+
+        "uncertainty_difference_DKK": (
+            uncertainty_difference
+        ),
+        "expected_objective_change_vs_deterministic_dp_DKK": (
+            evaluation["expected_community_objective_DKK"]
+            - float(dp_results["summary"]["objectives_DKK"]["DP"])
+        ),
+        "scenario_count": n,
+        "seed": seed,
+        "uncertain_quantity": "profile",
+        "expected_objective_components_DKK": evaluation[
+            "expected_objective_components_DKK"
+        ],
+        "expected_community_objective_DKK": evaluation[
+            "expected_community_objective_DKK"
+        ],
+        "expected_capacity_exceedance_kWh": evaluation[
+            "expected_capacity_exceedance_kWh"
+        ],
+        "probability_of_capacity_exceedance": evaluation[
+            "probability_of_capacity_exceedance"
+        ],
+        "tolerance": evaluation["tolerance"],
+        "objective_tolerance_DKK": evaluation["objective_tolerance_DKK"],
+        "dt_hours": evaluation["dt_hours"],
+        "interpretation_note": evaluation["interpretation_note"],
+        "scenarios": [],
+    }
+    for scenario in evaluation["scenarios"]:
+        member_schedules = {}
+        for cid, result in scenario["member_results"].items():
+            member_schedules[cid] = {
+                "load_kW": result.load_kW.tolist(),
+                "pv_kW": result.pv_kW.tolist(),
+                "net_exchange_kW": result.net_exchange_kW.tolist(),
+                "deviation_kW": result.deviation_kW.tolist(),
+                "soc_kWh": None if result.soc_kWh is None else result.soc_kWh.tolist(),
+                "charge_kW": None if result.charge_kW is None else result.charge_kW.tolist(),
+                "discharge_kW": (
+                    None if result.discharge_kW is None
+                    else result.discharge_kW.tolist()
+                ),
+                "objective_DKK": float(result.objective_DKK),
+            }
+        community_metrics = {
+            key: value.tolist() if isinstance(value, np.ndarray) else value
+            for key, value in scenario["community"].items()
+        }
+        payload["scenarios"].append({
+            "id": scenario["id"],
+            "probability": scenario["probability"],
+            "theta": scenario["theta"],
+            "members": scenario["members"],
+            "member_schedules": member_schedules,
+            "community": community_metrics,
+        })
+
+   # Create a separate directory for each Q3 experiment
+    if n == 1:
+        experiment_name = "baseline"
+    else:
+        experiment_name = f"uncertain_N{n}_seed{seed}"
+
+    result_path = (
+        Path(output_dir)
+        / "Q3"
+        / "fixed_price"
+        / experiment_name
+        / "results.json"
+    )
+
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+
+    result_path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    print("\n=== QUESTION 3: FIXED-PRICE EVALUATION ===")
+    print(
+        "Deterministic DP objective: "
+        f"{payload['deterministic_dp_objective_DKK']:.6f} DKK"
+    )
+    print(
+    "Independent deterministic baseline: "
+    f"{independent_baseline_objective:.6f} DKK"
+    )
+
+    print(
+        "Implementation difference: "
+        f"{implementation_difference:+.6f} DKK"
+    )
+
+    print(
+        "Uncertainty difference: "
+        f"{uncertainty_difference:+.6f} DKK"
+    )
+    print(f"Expected community objective: {payload['expected_community_objective_DKK']:.6f} DKK")
+    print(
+        "Expected change vs deterministic DP: "
+        f"{payload['expected_objective_change_vs_deterministic_dp_DKK']:+.6f} DKK"
+    )
+    print(f"Expected capacity exceedance: {payload['expected_capacity_exceedance_kWh']:.6f} kWh")
+    print(f"Probability of capacity exceedance: {payload['probability_of_capacity_exceedance']:.3%}")
+    for scenario in evaluation["scenarios"]:
+        metrics = scenario["community"]
+        print(
+            f"Scenario {scenario['id']}: p={scenario['probability']:.3f}, "
+            f"objective={metrics['total_objective_DKK']:.6f} DKK, "
+            f"import={metrics['daily_import_kWh']:.3f} kWh, "
+            f"peak={metrics['peak_community_import_kW']:.3f} kW, "
+            f"exceedance={metrics['capacity_exceedance_kWh']:.3f} kWh"
+        )
+    print(payload["interpretation_note"])
+    print(f"Results saved to: {result_path}")
+    return evaluation
+
 def main() -> None:
     """Parse the experiment options and run the selected reproducible command."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -536,6 +823,14 @@ def main() -> None:
     ap.add_argument("--day", default="d1", help="d1 (base case) ... d7")
     ap.add_argument("--members", action="store_true", help="Print every member's input summary")
     ap.add_argument("--demo", action="store_true", help="Run the Question 3 scenario demonstration")
+    ap.add_argument("--q3-scenarios", action="store_true", help="Generate and validate Question 3 preference scenarios")
+    ap.add_argument("--q3-evaluate", action="store_true",
+                    help="Evaluate fixed Q2 DP prices under Question 3 preference scenarios")
+    ap.add_argument("--q3-scenario-count", type=int, default=5,
+                    help="Number of equiprobable Question 3 scenarios (default: 5)")
+    ap.add_argument("--q3-seed", type=int, default=1,
+                    help="Random seed for Question 3 preference scenarios (default: 1)")
+    ap.add_argument("--validate-fixed-prices", action="store_true", help="Validate independent consumer responses against Q2 DP results",)
     ap.add_argument("--model", choices=["R", "I", "C", "DP", "both", "all", "none"], default="all",
                     help="R, I, C, DP (Q2 Cap Only), both (R+I), all (R+I+C), or none")
     ap.add_argument("--verbose-solver", action="store_true", help="Show Gurobi solver output")
@@ -561,6 +856,10 @@ def main() -> None:
     ap.add_argument("--reference-diagnostics", action="store_true",
                     help="Certify R's exceedance range across alternative economic optima")
     args = ap.parse_args()
+    if args.q3_scenario_count < 1:
+        ap.error("--q3-scenario-count must be a positive integer")
+    if args.q3_scenarios and args.q3_evaluate:
+        ap.error("--q3-scenarios and --q3-evaluate are mutually exclusive")
     if not np.isfinite(args.price_bound_extension) or args.price_bound_extension < 0:
         ap.error('--price-bound-extension must be finite and non-negative')
     if args.price_bound_extension != 0 and args.model != 'DP':
@@ -582,6 +881,40 @@ def main() -> None:
     community = load_community(args.community, day=args.day)
     output_dir = RESULTS_DIR / args.community / args.day
     print(community.summary(), "\n")
+    if args.q3_scenarios:
+        scenarios = prepare_q3_scenarios(
+            community,
+            n=args.q3_scenario_count,
+            seed=args.q3_seed,
+        )
+
+        print("\n=== QUESTION 3: PREFERENCE SCENARIOS ===")
+
+        for scenario in scenarios:
+            print(
+                f"\nScenario {scenario['id']} "
+                f"(probability={scenario['probability']:.3f})"
+            )
+
+            for member in scenario["members"][:2]:
+                print(
+                    f"{member.consumer_id}: "
+                    f"Reference energy = {np.sum(member.reference_load):.3f} kWh | "
+                    f"Minimum energy = {member.min_daily_energy_kWh:.3f} kWh"
+                )
+
+        return
+    if args.q3_evaluate:
+        run_q3_fixed_price_evaluation(
+            community,
+            output_dir,
+            n=args.q3_scenario_count,
+            seed=args.q3_seed,
+        )
+        return
+    if args.validate_fixed_prices:
+        validate_fixed_price_response(community, output_dir)
+        return
     if args.sensitivity:
         dimensions = ("discount", "cap") if args.sensitivity == "both" else (args.sensitivity,)
         run_contract_sensitivity(
