@@ -66,6 +66,102 @@ def analytical_case():
 
 
 class DPAnalysisTests(unittest.TestCase):
+    def test_report_loader_rejects_stale_case_outside_the_study_ledger(self):
+        from src.analysis import load_dp_report_data
+        community,reference,individual,central,dp=analytical_case()
+        community.contract.capacity_limit_daily_energy_factor=1.3
+        a=analyse_dp(community,reference,individual,central,dp)
+        payload=dict(summary=a.summary,members=a.members,hourly=a.hourly)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);point=root/'DP/cap_study/f_1.3';point.mkdir(parents=True)
+            for filename in ['cap_only.json','budget_balance.json']:
+                (point/filename).write_text(json.dumps(payload))
+            (point.parent/'study.json').write_text(json.dumps(dict(rows=[
+                dict(variant='cap_only',cap_factor=1.3,community_cost_DKK=dp.objective_DKK+1)])))
+            with self.assertRaisesRegex(ValueError,'ledger'):
+                load_dp_report_data(community,root)
+
+    def test_report_plots_cli_does_not_solve(self):
+        with patch.object(main,'run_q2_report_plots') as report, \
+             patch.object(main,'solve_community') as solve, \
+             patch('sys.argv',['main.py','--day','d1','--report-plots']), redirect_stdout(io.StringIO()):
+            main.main()
+        report.assert_called_once();solve.assert_not_called()
+        with patch('sys.argv',['main.py','--report-plots','--sensitivity','cap']), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):main.main()
+
+    def test_soft_checkpoint_reconstruction_checks_bills_and_bound_meaning(self):
+        from src.analysis import soft_ir_report_payload
+        community=copy.deepcopy(load_community('base'))
+        member=community.members[0];community.members=[member]
+        for key in ('energy_price','pv_profile','pv_available','reference_load','load_lower_kWh','load_upper_kWh'):
+            setattr(member,key,getattr(member,key)[[10,16]].copy())
+        member.hours=np.arange(2);member.min_daily_energy_kWh=float(member.reference_load.sum())
+        community.contract.capacity_limit_kW=np.full(2,9.39)
+        buy=member.energy_price+.25*member.import_tariff
+        sell=member.energy_price-.25*member.export_tariff
+        cost=float(buy@member.reference_load);ref=cost+.75*member.import_tariff*member.reference_load.sum()
+        values={}
+        for t in range(2):
+            for name,value in {'internal_price':buy[t],'community_import':member.reference_load[t],
+                               'community_export':0.,'community_exceedance':0.,
+                               'C1_load':member.reference_load[t],'C1_pv':0.,'C1_deviation':0.}.items():
+                values[f'{name}[{t}]']=value
+        base=dict(summary=dict(objectives_DKK={'R':ref,'I':cost,'C':cost,'DP':cost}),
+                  members=[dict(consumer_id='C1',reference_cost_DKK=ref,individual_cost_DKK=cost)],
+                  hourly=[dict(hour=t+1,cap_kW=9.39,day_ahead_price_DKK_per_kWh=member.energy_price[t],
+                               discounted_import_price_DKK_per_kWh=buy[t],discounted_export_price_DKK_per_kWh=sell[t]) for t in range(2)])
+        diagnosis=dict(validation_passed=True,actual_community_cost_DKK=cost,solver_status_name='TIME_LIMIT',
+                       best_bound_DKK=0.,best_total_ir_slack_DKK=0.,mip_gap=1.,
+                       members=[dict(consumer_id='C1',settled_cost_DKK=cost,reference_cost_DKK=ref)])
+        result=soft_ir_report_payload(community,base,diagnosis,values)
+        self.assertAlmostEqual(result['summary']['manager_surplus_DKK'],0.)
+        self.assertIsNone(result['summary']['best_bound_DKK'])
+        self.assertEqual(result['summary']['IR_slack_lower_bound_DKK'],0.)
+        self.assertFalse(result['summary']['dp_proven_optimal'])
+        bad=copy.deepcopy(diagnosis);bad['actual_community_cost_DKK']+=1
+        with self.assertRaises(ValueError):soft_ir_report_payload(community,base,bad,values)
+        bad_values=dict(values);bad_values['community_exceedance[0]']=.1
+        with self.assertRaises(ValueError):soft_ir_report_payload(community,base,diagnosis,bad_values)
+
+    def test_q2_cap_study_cli_and_validation(self):
+        with patch.object(main, 'run_dp_contract_sensitivity') as run, \
+             patch('sys.argv', ['main.py','--model','DP','--sensitivity','cap',
+                                '--cap-factors','1','6','--dp-time-limit','60']), redirect_stdout(io.StringIO()):
+            main.main()
+        self.assertEqual(run.call_args.kwargs['cap_factors'], [1.,6.])
+        self.assertEqual(run.call_args.kwargs['time_limit'],60)
+        for extra in (['--sensitivity','discount'], ['--sensitivity','cap','--budget-balance'],
+                      ['--sensitivity','cap','--dp-time-limit','nan']):
+            with patch('sys.argv',['main.py','--model','DP',*extra]), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):main.main()
+
+    def test_c_witness_preserves_dispatch_but_reconstructs_bills(self):
+        community, _, _, central, _ = analytical_case()
+        witness = main.central_price_witness(community, central)
+        self.assertIsNone(witness.solver_status)  # Certificate, not a fabricated MILP run.
+        self.assertIsNone(central.internal_prices)
+        for member in community.members:
+            own = witness.member_results[member.consumer_id]
+            np.testing.assert_equal(own.net_exchange_kW, central.member_results[member.consumer_id].net_exchange_kW)
+            expected = central.balance_duals@own.net_exchange_kW + member.pv_marginal_cost*own.pv_kW.sum()
+            self.assertAlmostEqual(own.objective_DKK,expected)
+
+    def test_response_ranges_distinguish_ties_from_epsilon_movement(self):
+        from src.model import follower_exchange_ranges
+        member = copy.deepcopy(load_community('base').members[0])
+        indices = [10,16]
+        for key in ('energy_price','pv_profile','pv_available','reference_load','load_lower_kWh','load_upper_kWh'):
+            setattr(member,key,getattr(member,key)[indices].copy())
+        member.hours = np.arange(2)
+        member.min_daily_energy_kWh = float(member.reference_load.sum())
+        tied = follower_exchange_ranges(member,[1.,1.5])
+        unique = follower_exchange_ranges(member,[1.,1.])
+        self.assertTrue(all(r['indifferent'] for r in tied))
+        self.assertGreater(tied[0]['range_kW'], .5)
+        self.assertFalse(any(r['indifferent'] for r in unique))
+        with self.assertRaises(ValueError):follower_exchange_ranges(member,[1.,float('nan')])
+
     def setUp(self):
         self.case = analytical_case()
 
@@ -451,6 +547,102 @@ class DPAnalysisTests(unittest.TestCase):
             self.assertNotIn('actual_community_cost_DKK', report)
             self.assertIn(conclusion, report['feasibility_conclusion'])
             model.dispose.assert_called_once()
+
+    def test_bb_warm_start_cli_and_invalid_combinations(self):
+        args = ['main.py', '--model', 'DP', '--budget-balance', '--individual-rationality',
+                '--ir-slack-check', '--bb-warm-start']
+        with patch('sys.argv', args), patch('main.load_community', return_value=self.case[0]), \
+             patch('main.solve_community', return_value=self.case[1]), \
+             patch('main.diagnose_bb_ir_slacks') as diagnose, redirect_stdout(io.StringIO()):
+            main.main()
+        self.assertTrue(diagnose.call_args.kwargs['bb_warm_start'])
+        self.assertEqual(diagnose.call_args.kwargs['output_dir'].name, 'bb_ir_delta_0')
+        for invalid in (['main.py', '--bb-warm-start'],
+                        [item for item in args if item != '--ir-slack-check']):
+            with self.subTest(args=invalid), patch('sys.argv', invalid), \
+                 redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main.main()
+
+    def test_bb_warm_start_preserves_full_solution_without_fixing_variables(self):
+        """A real small MILP exercises both solves, starts, logs and checkpoints."""
+        community = load_community('base')
+        community.members = [community.members[0]]
+        member = community.members[0]
+        for name in ('hours', 'energy_price', 'pv_profile', 'pv_available',
+                     'reference_load', 'load_upper_kWh', 'load_lower_kWh'):
+            setattr(member, name, getattr(member, name)[:2].copy())
+        member.min_daily_energy_kWh = float(member.reference_load.sum())
+        community.contract.capacity_limit_kW = np.full(2, 10.0)
+        refs = main.solve_community(community, model_type='R')
+        optimization = CommunityModel(community, model_type='DP', budget_balance=True)
+        actual_dispose = optimization.model.dispose
+        directory = self.temporary_output()
+        try:
+            with patch('main.CommunityModel', return_value=optimization), \
+                 patch.object(gp.Model, 'dispose'), redirect_stdout(io.StringIO()):
+                report = main.diagnose_bb_ir_slacks(
+                    community, refs, bb_warm_start=True, output_dir=directory)
+            self.assertTrue(report['bb_seed']['validation_passed'])
+            self.assertTrue(report['validation_passed'])
+            self.assertIn('is feasible', report['feasibility_conclusion'])
+            self.assertLessEqual(report['actual_total_ir_violation_DKK'], 1e-5)
+            seed = {}
+            for line in (directory / 'bb_start.sol').read_text().splitlines():
+                if line and not line.startswith('#'):
+                    name, value = line.split()
+                    seed[name] = float(value)
+            for name, value in seed.items():
+                var = optimization.model.getVarByName(name)
+                self.assertAlmostEqual(var.Start, value)
+            self.assertTrue(any(name.endswith('_dual') for name in seed))
+            self.assertTrue(any(name.endswith('_active') for name in seed))
+            for var in optimization.model.getVars():
+                if var.VType == GRB.BINARY:
+                    self.assertEqual((var.LB, var.UB), (0, 1))
+            self.assertFalse(any(row.ConstrName.startswith('individual_rationality_')
+                                 for row in optimization.model.getConstrs()))
+            self.assertEqual(json.loads((directory / 'diagnosis.json').read_text()), report)
+            self.assertTrue((directory / 'ir_slack_best.sol').is_file())
+            self.assertIn('MIP start', (directory / 'ir_slack.log').read_text())
+        finally:
+            actual_dispose()
+
+    def test_ir_slack_accepts_excess_slack_in_a_time_limited_incumbent(self):
+        """Slack coverage is sufficient; tightness is not a feasibility condition."""
+        community, refs = self.case[:2]
+        model = Mock(Status=GRB.TIME_LIMIT, SolCount=1, Runtime=300.0,
+                     ObjVal=12.0, ObjBound=0.0, MIPGap=1.0)
+        model.Params = SimpleNamespace()
+        model.getObjective.return_value.getValue.return_value = 3.5
+        slack = {'buyer': SimpleNamespace(X=6.0), 'supplier': SimpleNamespace(X=6.0)}
+        slack_vars = gp.Model(); slack_vars.Params.OutputFlag = 0
+        # Gurobi expressions are needed to build the diagnostic objective/rows;
+        # replace the return values with incumbent stand-ins only at optimize().
+        symbolic = slack_vars.addVars(community.member_ids)
+        model.addVars.return_value = symbolic
+        blocks = {cid: SimpleNamespace(
+            net_exchange={0: Mock(getValue=Mock(return_value=q)),
+                          1: Mock(getValue=Mock(return_value=0.0))},
+            physical_cost=Mock(getValue=Mock(return_value=0.0)),
+            disutility_cost=Mock(getValue=Mock(return_value=0.0)))
+            for cid, q in [('buyer', 2.0), ('supplier', -0.25)]}
+        duals = {'buyer': gp.LinExpr(4.0), 'supplier': gp.LinExpr(-0.5)}
+        opt = Mock(model=model, blocks=blocks, T=range(2), follower_dual_objectives=duals,
+                   internal_prices={0: SimpleNamespace(X=2.0), 1: SimpleNamespace(X=2.0)},
+                   objective_components={'procurement': Mock(getValue=Mock(return_value=3.5)),
+                                         'penalty': Mock(getValue=Mock(return_value=0.0))})
+        def incumbent():
+            symbolic.update(slack)
+        model.optimize.side_effect = incumbent
+        try:
+            with patch('main.CommunityModel', return_value=opt), redirect_stdout(io.StringIO()):
+                report = main.diagnose_bb_ir_slacks(community, refs)
+            self.assertTrue(report['validation_passed'])
+            self.assertAlmostEqual(report['actual_total_ir_violation_DKK'], 2.5)
+            self.assertEqual(report['best_total_ir_slack_DKK'], 12.0)
+            self.assertIn('unresolved', report['feasibility_conclusion'])
+        finally:
+            slack_vars.dispose()
 
     def test_feasibility_solution_limit_checks_actual_cost(self):
         self.case[1]['supplier'].objective_DKK = -2.8

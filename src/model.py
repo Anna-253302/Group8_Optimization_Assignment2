@@ -981,6 +981,61 @@ class CommunityModel:
 # REFERENCE OPTIMAL-FACE DIAGNOSTIC
 # ==========================================================
 
+def follower_exchange_ranges(member, prices, *, objective_tolerance=1e-7,
+                             quantity_tolerance=1e-4):
+    """Range net exchange on one follower's epsilon-optimal face at fixed prices.
+
+    A quantity threshold distinguishes substantive indifference from the small
+    movements introduced by the objective tolerance. No community constraints
+    enter these independent LPs. The result is specific to the posted prices.
+    """
+    prices = np.asarray(prices, dtype=float)
+    if prices.shape != (member.n_hours,) or not np.all(np.isfinite(prices)):
+        raise ValueError('Expected one finite price per hour')
+    if not np.isfinite(objective_tolerance) or objective_tolerance <= 0:
+        raise ValueError('Objective tolerance must be positive and finite')
+    if not np.isfinite(quantity_tolerance) or quantity_tolerance <= 0:
+        raise ValueError('Quantity tolerance must be positive and finite')
+    import hashlib
+    price_hash = hashlib.sha256(prices.astype('<f8').tobytes()).hexdigest()
+    model = gp.Model('follower_optimal_face')
+    model.Params.OutputFlag = 0
+    try:
+        block = add_consumer_constraints(model, member)
+        for t, net in block.net_exchange.items():
+            if member.max_import_kW is not None:
+                model.addConstr(net <= member.max_import_kW)
+            if member.max_export_kW is not None:
+                model.addConstr(net >= -member.max_export_kW)
+        bill = block.physical_cost + block.disutility_cost + gp.quicksum(
+            prices[t] * net for t, net in block.net_exchange.items())
+        model.setObjective(bill)
+        model.optimize()
+        if model.Status != GRB.OPTIMAL:
+            raise RuntimeError('Follower optimum was not certified')
+        optimum = float(model.ObjVal)
+        model.addConstr(bill <= optimum + objective_tolerance)
+        rows = []
+        for t, net in block.net_exchange.items():
+            endpoints = []
+            for sense in (GRB.MINIMIZE, GRB.MAXIMIZE):
+                model.setObjective(net, sense)
+                model.optimize()
+                if model.Status != GRB.OPTIMAL:
+                    raise RuntimeError('Follower exchange range was not certified')
+                endpoints.append(float(model.ObjVal))
+            rows.append(dict(consumer_id=member.consumer_id, hour=t+1,
+                             minimum_net_import_kW=endpoints[0], maximum_net_import_kW=endpoints[1],
+                             range_kW=max(0., endpoints[1]-endpoints[0]),
+                             indifferent=bool(endpoints[1]-endpoints[0] > quantity_tolerance),
+                             optimal_bill_DKK=optimum,
+                             price_vector_sha256=price_hash,
+                             objective_tolerance_DKK=objective_tolerance,
+                             quantity_tolerance_kW=quantity_tolerance))
+        return rows
+    finally:
+        model.dispose()
+
 def reference_exceedance_range(community, *, tolerance=1e-7):
     """Find the min/max gross exceedance on R's optimal face, when linear there.
 

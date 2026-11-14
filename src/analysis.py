@@ -1119,6 +1119,273 @@ def analyse_dp(community, reference, individual, centralized, dp, *, tolerance=1
     return SettlementResult(members, hourly, costs, summary)
 
 
+def validate_dp_responses(community, dp, *, tolerance=1e-5):
+    """Check each selected schedule physically and against an independent optimum."""
+    rows = []
+    for member in community.members:
+        own = dp.member_results[member.consumer_id]
+        physical = _fixed_price_member_metrics(
+            member, own, dp.internal_prices, 'DP', tolerance=tolerance,
+            objective_tolerance=tolerance)
+        independent = solve_fixed_price_member(member, dp.internal_prices)
+        gap = float(own.objective_DKK-independent.objective_DKK)
+        if abs(gap) > tolerance:
+            raise ValueError(f'{member.consumer_id}: selected schedule is not follower-optimal')
+        rows.append(dict(consumer_id=member.consumer_id,
+                         maximum_physical_violation=physical['maximum_constraint_violation'],
+                         follower_gap_DKK=gap))
+    return rows
+
+
+def soft_ir_report_payload(community, base, diagnosis, solution, *, tolerance=1e-5):
+    """Reconstruct a soft-IR checkpoint for plotting; costs DKK, hourly powers kW.
+
+    No optimization is run. Actual physical schedules, meter accounting and
+    bills are checked against the saved diagnosis and matched R/I references.
+    This supports existing .sol checkpoints without changing their model.
+    """
+    if not diagnosis.get('validation_passed'):
+        raise ValueError('Soft-IR diagnosis did not pass validation')
+    n = community.members[0].n_hours
+    def series(name):
+        try:
+            result = np.array([solution[f'{name}[{t}]'] for t in range(n)], dtype=float)
+        except KeyError as exc:
+            raise ValueError(f'Incomplete soft-IR checkpoint: {exc}') from exc
+        if not np.all(np.isfinite(result)):
+            raise ValueError('Nonfinite checkpoint values')
+        return result
+    prices = series('internal_price')
+    base_members = {r['consumer_id']:r for r in base['members']}
+    diagnosed = {r['consumer_id']:r for r in diagnosis['members']}
+    if set(base_members) != set(community.member_ids) or set(diagnosed) != set(base_members):
+        raise ValueError('Checkpoint and report member IDs differ')
+    members, net_total, local_total, payments = [], np.zeros(n), 0., 0.
+    for member in community.members:
+        cid = member.consumer_id
+        load, pv, dev = (series(f'{cid}_{name}') for name in ['load','pv','deviation'])
+        charge = series(f'{cid}_charge') if member.has_battery else np.zeros(n)
+        discharge = series(f'{cid}_discharge') if member.has_battery else np.zeros(n)
+        soc = (np.array([solution[f'{cid}_soc[{t}]'] for t in range(n+1)])
+               if member.has_battery else None)
+        net = load+charge-discharge-pv
+        local = float(member.pv_marginal_cost*pv.sum()+member.linear_disutility*dev.sum())
+        payment = float(prices@net); bill = payment+local
+        own = ReferenceResult(cid,bill,load,pv,np.maximum(net,0),np.maximum(-net,0),net,dev,
+                              soc,charge if member.has_battery else None,
+                              discharge if member.has_battery else None)
+        _fixed_price_member_metrics(member,own,prices,'soft-IR checkpoint',
+                                    tolerance=tolerance,objective_tolerance=tolerance)
+        ref = base_members[cid]
+        if abs(bill-diagnosed[cid]['settled_cost_DKK']) > tolerance:
+            raise ValueError('Soft-IR checkpoint does not match the diagnosis')
+        if abs(ref['reference_cost_DKK']-diagnosed[cid]['reference_cost_DKK']) > tolerance:
+            raise ValueError('Soft-IR outside option differs from the selected base case')
+        members.append(dict(consumer_id=cid,slope_class=member.slope_class,
+                            has_pv=bool(member.has_pv),has_battery=bool(member.has_battery),
+                            reference_cost_DKK=ref['reference_cost_DKK'],
+                            individual_cost_DKK=ref['individual_cost_DKK'],
+                            settled_cost_DP_DKK=bill,payment_DP_DKK=payment,
+                            gain_vs_R_DKK=ref['reference_cost_DKK']-bill,
+                            gain_vs_I_DKK=ref['individual_cost_DKK']-bill))
+        net_total += net; local_total += local; payments += payment
+    imp, exp, excess = series('community_import'),series('community_export'),series('community_exceedance')
+    cap = np.asarray(community.contract.capacity_limit_kW)
+    if not np.allclose(imp-exp,net_total,atol=tolerance,rtol=0):
+        raise ValueError('Checkpoint community balance failed')
+    if np.any(np.minimum(imp,exp)>tolerance) or not np.allclose(excess,np.maximum(imp-cap,0),atol=tolerance,rtol=0):
+        raise ValueError('Checkpoint external accounting failed')
+    beta = community.contract.tariff_discount_ratio
+    buy = community.energy_price+(1-beta)*community.import_tariff
+    sell = community.energy_price-(1-beta)*community.export_tariff
+    if np.any(prices<sell-tolerance) or np.any(prices>buy+community.contract.penalty_DKK_per_kWh+tolerance):
+        raise ValueError('Checkpoint price bounds differ from the selected contract')
+    external = buy*imp-sell*exp+community.contract.penalty_DKK_per_kWh*excess
+    cost = float(external.sum()+local_total)
+    if abs(cost-diagnosis['actual_community_cost_DKK'])>tolerance or abs(payments-external.sum())>tolerance:
+        raise ValueError('Checkpoint cost or budget does not match the diagnosis')
+    hourly = [dict(base['hourly'][t],dp_internal_price_DKK_per_kWh=float(prices[t]),
+                   dp_import_kW=float(imp[t]),dp_export_kW=float(exp[t]),
+                   dp_exceedance_kW=float(excess[t])) for t in range(n)]
+    summary = dict(community=community.community,day=community.day,
+                   model_variant='DP_budget_balance_soft_ir',tolerance=tolerance,
+                   objectives_DKK=dict(base['summary']['objectives_DKK'],DP=cost),
+                   manager_surplus_DKK=float(payments-external.sum()),
+                   total_payments_DKK=payments,external_bill_DKK=float(external.sum()),
+                   efficiency_loss_DKK=cost-base['summary']['objectives_DKK']['C'],
+                   peak_import_kW=float(imp.max()),daily_import_kWh=float(imp.sum()),
+                   exceedance_kWh=float(excess.sum()),optimality_certified=False,
+                   dp_proven_optimal=False,solver_status_name=diagnosis['solver_status_name'],
+                   budget_balance_enforced=True,individual_rationality_enforced=False,
+                   manager_budget_balanced=True,validation_passed=True,
+                   mip_gap=None,best_bound_DKK=None,
+                   IR_slack_lower_bound_DKK=diagnosis.get('best_bound_DKK'),
+                   IR_slack_objective_DKK=diagnosis.get('best_total_ir_slack_DKK'),
+                   IR_slack_mip_gap=diagnosis.get('mip_gap'),
+                   worse_off_vs_R=[r['consumer_id'] for r in members if r['gain_vs_R_DKK'] < -tolerance],
+                   worse_off_vs_I=[r['consumer_id'] for r in members if r['gain_vs_I_DKK'] < -tolerance])
+    return dict(summary=summary,members=members,hourly=hourly)
+
+
+def load_dp_report_data(community, results_dir):
+    """Load matched study/checkpoint outputs and export an auditable report dataset.
+
+    results_dir is the day folder, e.g. results/base/d1. No solves or changes to
+    source results occur. Files for a different day, membership or cap are rejected.
+    """
+    import hashlib
+    root = Path(results_dir)
+    dp = root/'DP'; study_dir = dp/'cap_study'
+    factor = float(community.contract.capacity_limit_daily_energy_factor)
+    point = study_dir/f'f_{factor:g}'
+    study = json.loads((study_dir/'study.json').read_text())
+    paths = {'cap_only':point/'cap_only.json','BB':point/'budget_balance.json'}
+    hard_ir = next((r for r in study['rows'] if r['variant']=='BB_IR'
+                    and np.isclose(r['cap_factor'],factor)),None)
+    if hard_ir is not None and hard_ir['community_cost_DKK'] is not None:
+        paths['BB_IR'] = point/'budget_balance_ir.json'
+    cases = {name:json.loads(path.read_text()) for name,path in paths.items()}
+    for variant,case in cases.items():
+        summary = case['summary']
+        if not summary.get('validation_passed'):
+            raise ValueError('Report input did not pass its model validation')
+        ledger = next((r for r in study['rows'] if r['variant']==variant
+                       and np.isclose(r['cap_factor'],factor)),None)
+        if ledger is None or ledger['community_cost_DKK'] is None:
+            raise ValueError('Saved case has no matching feasible outcome in the study ledger')
+        if abs(ledger['community_cost_DKK']-summary['objectives_DKK']['DP'])>1e-5:
+            raise ValueError('Saved case cost differs from the study ledger')
+        if summary['day']!=community.day or summary['community']!=community.community:
+            raise ValueError('Report inputs belong to a different day/community')
+        hours = sorted(case['hourly'],key=lambda r:r['hour'])
+        if [r['hour'] for r in hours] != list(range(1,len(community.energy_price)+1)):
+            raise ValueError('Report inputs have inconsistent hours')
+        case['hourly'] = hours
+        if not np.allclose([r['cap_kW'] for r in hours],community.contract.capacity_limit_kW,rtol=0,atol=1e-5):
+            raise ValueError('Report cap differs from the selected contract')
+        if not np.allclose([r['day_ahead_price_DKK_per_kWh'] for r in hours],community.energy_price,rtol=0,atol=1e-5):
+            raise ValueError('Report prices belong to another day')
+        discount=1-community.contract.tariff_discount_ratio
+        for key,expected in [('discounted_import_price_DKK_per_kWh',community.energy_price+discount*community.import_tariff),
+                             ('discounted_export_price_DKK_per_kWh',community.energy_price-discount*community.export_tariff)]:
+            if not np.allclose([r[key] for r in hours],expected,rtol=0,atol=1e-5):
+                raise ValueError('Report tariff differs from the selected contract')
+    reference = {m['consumer_id']:m for m in cases['cap_only']['members']}
+    if set(reference)!=set(community.member_ids):
+        raise ValueError('Report member IDs differ from the selected community')
+    for case in cases.values():
+        members={m['consumer_id']:m for m in case['members']}
+        if set(members)!=set(reference):raise ValueError('Report cases have different members')
+        for cid in reference:
+            for key in ['reference_cost_DKK','individual_cost_DKK']:
+                if abs(members[cid][key]-reference[cid][key])>1e-5:
+                    raise ValueError('Report cases use different R/I outside options')
+    diag_dir = dp/'diagnostics/bb_ir_delta_0'
+    paths.update(diagnosis=diag_dir/'diagnosis.json',soft_solution=diag_dir/'ir_slack_best.sol',
+                 study=study_dir/'study.json',ranges=study_dir/'response_ranges.csv')
+    diagnosis = json.loads(paths['diagnosis'].read_text())
+    values = {}
+    for line in paths['soft_solution'].read_text().splitlines():
+        if line.strip() and not line.startswith('#'):
+            name,value = line.split(); values[name] = float(value)
+    cases['soft_IR'] = soft_ir_report_payload(community,cases['cap_only'],diagnosis,values)
+    with paths['ranges'].open(newline='') as f:
+        ranges = list(csv.DictReader(f))
+    if len(ranges)!=len(community.member_ids)*len(community.energy_price):
+        raise ValueError('Incomplete response-range table')
+    bills = {r['consumer_id']:r['settled_cost_DP_DKK'] for r in cases['cap_only']['members']}
+    price_hash = hashlib.sha256(np.array([r['dp_internal_price_DKK_per_kWh']
+                  for r in cases['cap_only']['hourly']],dtype='<f8').tobytes()).hexdigest()
+    for row in ranges:
+        if row.get('price_vector_sha256') and row['price_vector_sha256']!=price_hash:
+            raise ValueError('Response ranges belong to a different posted price vector')
+        if row['consumer_id'] not in bills or abs(float(row['optimal_bill_DKK'])-bills[row['consumer_id']])>1e-5:
+            raise ValueError('Response ranges do not match the selected follower bills')
+    folder = dp/'report'; folder.mkdir(parents=True,exist_ok=True)
+    provenance = {key:dict(path=str(path.relative_to(root)),sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                  for key,path in paths.items()}
+    payload = dict(cases=cases,study=study,ranges=ranges,sources=provenance,base_factor=factor,
+                   interpretation='Selected incumbents are not certified optima; soft-IR slack bounds concern losses, not community cost.')
+    (folder/'selected_runs.json').write_text(json.dumps(payload,indent=2,allow_nan=False)+'\n')
+    rows=[]
+    for variant,case in cases.items():
+        summary=case['summary'];members=case['members']
+        rows.append(dict(variant=variant,cost_DKK=summary['objectives_DKK']['DP'],
+                         manager_surplus_DKK=summary['manager_surplus_DKK'],
+                         total_loss_vs_R_DKK=sum(max(0,-m['gain_vs_R_DKK']) for m in members),
+                         losers_vs_R=len(summary['worse_off_vs_R']),losers_vs_I=len(summary['worse_off_vs_I']),
+                         peak_import_kW=summary['peak_import_kW'],exceedance_kWh=summary['exceedance_kWh']))
+    _write_csv(folder/'base_comparison.csv',rows)
+    export_dp_report_tables(payload,folder)
+    return payload
+
+
+def export_dp_report_tables(payload, output_dir):
+    """Generate LaTeX table bodies from the same selected data as the figures."""
+    folder=Path(output_dir);folder.mkdir(parents=True,exist_ok=True)
+    cases=payload['cases']; rows=[]
+    def number(v):return '--' if v is None else f'{0. if abs(v)<1e-5 else v:.2f}'
+    for key,label in [('cap_only','C-supported DP'),('BB','DP+BB'),('BB_IR','DP+BB+IR'),('soft_IR','Soft IR')]:
+        if key=='BB_IR' and key not in cases:
+            rows.append(r'DP+BB+IR & -- & -- & -- & -- & -- \\')
+            continue
+        c=cases[key];s=c['summary'];m=c['members']
+        values=[label,number(s['objectives_DKK']['DP']),number(s['manager_surplus_DKK']),
+                number(sum(max(0,-r['gain_vs_R_DKK']) for r in m)),
+                f"{len(s['worse_off_vs_R'])}/{len(s['worse_off_vs_I'])}",number(s['peak_import_kW'])]
+        rows.append(' & '.join(values)+r' \\')
+    base='\n'.join([r'\begin{tabular}{lrrrrr}',r'\toprule',
+                    r'Variant & Cost & $B$ & Losses vs R & Losers R/I & Peak\\',r'\midrule',
+                    *rows,r'\bottomrule',r'\end{tabular}'])+'\n'
+    (folder/'base_comparison.tex').write_text(base)
+    study=payload['study']['rows'];caps=[]
+    names={'PROVEN_INFEASIBLE':'Impossible','UNRESOLVED':'Unresolved',
+           'OPTIMAL_CERTIFICATE':'Optimal witness','FEASIBLE_INCUMBENT':'Feasible witness'}
+    for f in sorted({r['cap_factor'] for r in study}):
+        rs={r['variant']:r for r in study if r['cap_factor']==f}
+        vals=[f'{f:g}',number(rs['cap_only']['cap_kW']),number(rs['cap_only']['community_cost_DKK']),
+              number(rs['BB']['community_cost_DKK']),names[rs['BB_IR']['outcome']]]
+        caps.append(' & '.join(vals)+r' \\')
+    cap='\n'.join([r'\begin{tabular}{rrrrl}',r'\toprule',
+                   r'$f$ & Cap [kW] & C cost [DKK] & BB cost [DKK] & BB+IR vs R\\',
+                   r'\midrule',*caps,r'\bottomrule',r'\end{tabular}'])+'\n'
+    (folder/'cap_comparison.tex').write_text(cap)
+
+
+def dp_study_row(analysis, factor, variant, *, outcome, method, lower_bound=None,
+                 runtime=None, optimality_certified=False):
+    """One comparable contract-study row; losses use actual settled bills."""
+    s = analysis.summary
+    return dict(cap_factor=float(factor), cap_kW=float(analysis.hourly[0]['cap_kW']),
+                variant=variant, outcome=outcome, method=method,
+                community_cost_DKK=s['objectives_DKK']['DP'], C_cost_DKK=s['objectives_DKK']['C'],
+                R_cost_DKK=s['objectives_DKK']['R'], I_cost_DKK=s['objectives_DKK']['I'],
+                lower_bound_DKK=lower_bound, runtime_seconds=runtime,
+                mip_gap=s['mip_gap'], optimality_certified=bool(optimality_certified),
+                efficiency_loss_DKK=s['efficiency_loss_DKK'], manager_surplus_DKK=s['manager_surplus_DKK'],
+                peak_import_kW=s['peak_import_kW'], daily_import_kWh=s['daily_import_kWh'],
+                exceedance_kWh=s['exceedance_kWh'],
+                total_loss_vs_R_DKK=sum(max(0., -m['gain_vs_R_DKK']) for m in analysis.members),
+                maximum_loss_vs_R_DKK=max(max(0., -m['gain_vs_R_DKK']) for m in analysis.members),
+                losers_vs_R=len(s['worse_off_vs_R']), losers_vs_I=len(s['worse_off_vs_I']))
+
+
+def export_dp_study(rows, ranges, records, output_dir):
+    """Checkpoint the complete selected rows, raw response ranges and search metadata."""
+    folder = Path(output_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    keys = list(dict.fromkeys(k for row in rows for k in row))
+    _write_csv(folder / 'comparison.csv', [{k:row.get(k) for k in keys} for row in rows])
+    if ranges:
+        _write_csv(folder / 'response_ranges.csv', ranges)
+    (folder / 'study.json').write_text(json.dumps(
+        dict(rows=rows, searches=records,
+             hypothesis='Cap relaxation improves affordability but may weaken import limitation; participation is not implied by aggregate savings.',
+             interpretation='Certificates prove existence or impossibility as stated. A time-limited incumbent is an upper bound; no incumbent is unresolved unless infeasibility is certified.',
+             fixed_day=True, fixed_discount=True, fixed_penalty=True, price_bound_extension=0),
+        indent=2, allow_nan=False)+'\n', encoding='utf-8')
+
+
 def export_dp_analysis(analysis, output_dir):
     """Write all validated DP results to one strict JSON file in the DP directory."""
     payload = dict(summary=dict(analysis.summary, cost_breakdown=analysis.costs),
