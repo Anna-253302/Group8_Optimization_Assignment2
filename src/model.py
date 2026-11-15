@@ -674,6 +674,25 @@ def solve_individual_contracts(
 # PARAMETRIZED COMMUNITY MODEL (R / I / C / DP)
 # ==========================================================
 
+#That for Q2 and Q3 the same price bounds are used for each scenario
+def dp_price_bounds(community, delta=0.0):
+        member = community.members[0]
+        beta = community.contract.tariff_discount_ratio
+        alpha = community.contract.penalty_DKK_per_kWh
+        T = range(member.n_hours)
+
+        lower = {
+            t: float(member.energy_price[t])
+            - (1-beta)*member.export_tariff - delta
+            for t in T
+        }
+        upper = {
+            t: float(member.energy_price[t])
+            + (1-beta)*member.import_tariff + alpha + delta
+            for t in T
+        }
+        return lower, upper
+
 class CommunityModel:
     """Shared physical LP for R/I/C; DP adds prices and follower KKT conditions."""
 
@@ -815,17 +834,12 @@ class CommunityModel:
             self.penalty_cost = alpha * gp.quicksum(self.exceedance[t] for t in T)
 
     def _build_internal_prices(self):
-        """Extend the marginal-external-cost price bounds symmetrically."""
-        member = self.community.members[0]
-        beta = self.config.tariff_discount
-        alpha = float(self.community.contract.penalty_DKK_per_kWh)
-        delta = self.price_bound_extension
-        lower = {t: float(member.energy_price[t]) - (1-beta)*member.export_tariff - delta
-                 for t in self.T}
-        upper = {t: float(member.energy_price[t]) + (1-beta)*member.import_tariff + alpha + delta
-                 for t in self.T}
+        lower, upper = dp_price_bounds(
+            self.community, self.price_bound_extension
+        )
         self.internal_prices = self.model.addVars(
-            self.T, lb=lower, ub=upper, name='internal_price')
+            self.T, lb=lower, ub=upper, name="internal_price"
+        )
 
     def _build_follower_optimality(self):
         """Require optimal consumer responses, with optimistic tie breaking."""
@@ -1088,3 +1102,353 @@ def reference_exceedance_range(community, *, tolerance=1e-7):
         return report
     finally:
         model.dispose()
+
+
+
+class StochasticPricingModel:
+    """Risk-neutral and CVaR-averse two-stage dynamic pricing."""
+
+    def __init__(self, community, scenarios, *, verbose=False, expected_budget_balance=False, expected_individual_rationality=False, reference_costs_DKK=None,
+        risk_weight=0.0,
+        cvar_alpha=0.95,
+    ):
+        self.community = community
+        self.scenarios = list(scenarios)
+
+        # CVaR parameters
+        self.risk_weight = float(risk_weight)
+        self.cvar_alpha = float(cvar_alpha)
+
+        if not np.isfinite(self.risk_weight) or self.risk_weight < 0:
+            raise ValueError("risk_weight must be finite and non-negative")
+
+        if not np.isfinite(self.cvar_alpha) or not 0 <= self.cvar_alpha < 1:
+            raise ValueError("cvar_alpha must be between 0 (inclusive) and 1 (exclusive)")
+
+        self.expected_budget_balance = expected_budget_balance
+        self.expected_individual_rationality = expected_individual_rationality
+        self.reference_costs_DKK = reference_costs_DKK
+
+        if expected_individual_rationality and reference_costs_DKK is None:
+            raise ValueError("Expected IR requires reference costs")
+
+        if not self.scenarios:
+            raise ValueError("At least one scenario is required")
+
+        if not np.isclose(
+            sum(s["probability"] for s in self.scenarios), 1.0
+        ):
+            raise ValueError("Probabilities must sum to one")
+
+        self.model = gp.Model("SDP_expected_cost")
+        self.model.Params.OutputFlag = int(verbose)
+        self.model.Params.TimeLimit = 300
+        self.model.Params.MIPGap = 1e-3
+
+        self.T = range(community.members[0].n_hours)
+
+        self.blocks = {}
+        self.follower_cost = {}
+        self.scenario_cost = {}
+        self.external_cost = {}
+        self.payments = {}
+        self.imports = {}
+        self.exports = {}
+        self.exceedance = {}
+
+    def build(self):
+        m, T, community = self.model, self.T, self.community
+
+        # Stage 1: One shared price vector
+        lower, upper = dp_price_bounds(community)
+        self.prices = m.addVars(
+            T, lb=lower, ub=upper, name="price"
+        )
+
+        beta = community.contract.tariff_discount_ratio
+        alpha = community.contract.penalty_DKK_per_kWh
+        cap = community.contract.capacity_limit_kW
+        reference = community.members[0]
+
+        # Stage 2: Scenario-dependent consumer responses
+        for scenario in self.scenarios:
+            s = scenario["id"]
+            members = scenario["members"]
+
+            if {a.consumer_id for a in members} != set(community.member_ids):
+                raise ValueError(f"Scenario {s}: invalid members")
+
+            # Consumer blocks and KKT conditions
+            for member in members:
+                cid = member.consumer_id
+
+                block = add_consumer_constraints(
+                    m, member, prefix=f"s{s}_"
+                )
+                self.blocks[s, cid] = block
+
+                # Individual physical connection limits
+                if member.max_import_kW is not None:
+                    block.constraints["physical_import"] = m.addConstrs(
+                        (block.net_exchange[t] <= member.max_import_kW
+                         for t in T),
+                        name=f"s{s}_{cid}_physical_import"
+                    )
+
+                if member.max_export_kW is not None:
+                    block.constraints["physical_export"] = m.addConstrs(
+                        (block.net_exchange[t] >= -member.max_export_kW
+                         for t in T),
+                        name=f"s{s}_{cid}_physical_export"
+                    )
+
+                self.follower_cost[s, cid] = add_consumer_kkt(
+                    m, block, self.prices,
+                    prefix=f"kkt_s{s}_{cid}_"
+                )
+
+            # Scenario-specific community meter
+            imp = m.addVars(T, lb=0, name=f"import_s{s}")
+            exp = m.addVars(T, lb=0, name=f"export_s{s}")
+            exceed = m.addVars(T, lb=0, name=f"exceed_s{s}")
+
+            self.imports[s] = imp
+            self.exports[s] = exp
+            self.exceedance[s] = exceed
+
+            m.addConstrs(
+                (imp[t] - exp[t] == gp.quicksum(
+                    self.blocks[s, cid].net_exchange[t]
+                    for cid in community.member_ids
+                ) for t in T),
+                name=f"balance_s{s}"
+            )
+
+            m.addConstrs(
+                (exceed[t] >= imp[t] - float(cap[t])
+                 for t in T),
+                name=f"cap_s{s}"
+            )
+
+            # External electricity cost
+            procurement = gp.quicksum(
+                (float(reference.energy_price[t])
+                 + (1-beta)*reference.import_tariff) * imp[t]
+                - (float(reference.energy_price[t])
+                   - (1-beta)*reference.export_tariff) * exp[t]
+                for t in T
+            )
+
+            penalty = alpha * gp.quicksum(
+                exceed[t] for t in T
+            )
+
+            # Consumer PV and disutility costs
+            local = gp.quicksum(
+                self.blocks[s, cid].physical_cost
+                + self.blocks[s, cid].disutility_cost
+                for cid in community.member_ids
+            )
+
+            self.external_cost[s] = procurement + penalty
+            self.scenario_cost[s] = self.external_cost[s] + local
+
+            # Linearized payments, reusable for expected BB
+            self.payments[s] = gp.quicksum(
+                self.follower_cost[s, cid]
+                - self.blocks[s, cid].physical_cost
+                - self.blocks[s, cid].disutility_cost
+                for cid in community.member_ids
+            )
+
+
+        # Expected budget balance
+        if self.expected_budget_balance:
+
+            # Ensure exact grid accounting in each scenario
+            for scenario in self.scenarios:
+                s = scenario["id"]
+
+                active = m.addVars(
+                    T, vtype=GRB.BINARY,
+                    name=f"bb_cap_active_s{s}"
+                )
+
+                for t in T:
+                    imp = self.imports[s][t]
+                    exp = self.exports[s][t]
+                    exceed = self.exceedance[s][t]
+
+                    # No simultaneous import and export
+                    m.addSOS(
+                        GRB.SOS_TYPE1, [imp, exp]
+                    )
+
+                    # Exact cap exceedance
+                    m.addGenConstrIndicator(
+                        active[t], 0,
+                        exceed == 0,
+                        name=f"bb_no_exceed_s{s}_t{t}"
+                    )
+
+                    m.addGenConstrIndicator(
+                        active[t], 1,
+                        exceed == imp - float(cap[t]),
+                        name=f"bb_exceed_s{s}_t{t}"
+                    )
+
+            # Expected manager surplus
+            self.expected_manager_surplus = gp.quicksum(
+                float(scenario["probability"]) * (
+                    self.payments[scenario["id"]]
+                    - self.external_cost[scenario["id"]]
+                )
+                for scenario in self.scenarios
+            )
+
+            m.addConstr(
+                self.expected_manager_surplus == 0,
+                name="expected_budget_balance"
+            )
+
+
+        # Expected Individual Rationality
+        if self.expected_individual_rationality:
+
+            for cid in community.member_ids:
+
+                # Expected individual cost under internal prices
+                expected_dp_cost = gp.quicksum(
+                    float(scenario["probability"])
+                    * self.follower_cost[scenario["id"], cid]
+                    for scenario in self.scenarios
+                )
+
+                # Expected reference cost without community contract
+                expected_r_cost = sum(
+                    float(scenario["probability"])
+                    * float(
+                        self.reference_costs_DKK[
+                            scenario["id"]
+                        ][cid]
+                    )
+                    for scenario in self.scenarios
+                )
+
+                m.addConstr(
+                    expected_dp_cost <= expected_r_cost,
+                    name=f"expected_ir_{cid}"
+                )
+
+
+        # Minimize expected community costs
+        self.expected_community_cost = gp.quicksum(
+            float(s["probability"]) * self.scenario_cost[s["id"]]
+            for s in self.scenarios
+        )
+
+        objective = self.expected_community_cost
+
+        # CVaR risk-averse objective
+        self.cvar_cost = None
+
+        if self.risk_weight > 0:
+
+            # VaR threshold
+            self.cvar_eta = m.addVar(
+                lb=-GRB.INFINITY,
+                name="cvar_eta"
+            )
+
+            # Scenario-specific excess costs
+            scenario_ids = [s["id"] for s in self.scenarios]
+
+            self.cvar_excess = m.addVars(
+                scenario_ids,
+                lb=0.0,
+                name="cvar_excess"
+            )
+
+            # Excess cost constraints
+            for scenario in self.scenarios:
+                s = scenario["id"]
+
+                m.addConstr(
+                    self.cvar_excess[s]
+                    >= self.scenario_cost[s] - self.cvar_eta,
+                    name=f"cvar_excess_constraint_s{s}"
+                )
+
+            # Conditional Value at Risk
+            self.cvar_cost = (
+                self.cvar_eta
+                + (1.0 / (1.0 - self.cvar_alpha))
+                * gp.quicksum(
+                    float(s["probability"])
+                    * self.cvar_excess[s["id"]]
+                    for s in self.scenarios
+                )
+            )
+
+            # Risk-adjusted community objective
+            objective = (
+                self.expected_community_cost
+                + self.risk_weight * self.cvar_cost
+            )
+
+        m.setObjective(
+            objective,
+            GRB.MINIMIZE
+        )
+
+        return self
+
+
+    def solve(self):
+        self.model.optimize()
+
+        if self.model.SolCount == 0:
+            raise RuntimeError(
+                f"No SDP solution found; status={self.model.Status}"
+            )
+
+        return {
+            "prices": np.array(
+                [self.prices[t].X for t in self.T]
+            ),
+
+            "expected_cost_DKK": float(
+                self.expected_community_cost.getValue()
+            ),
+
+            "risk_adjusted_objective_DKK": float(
+                self.model.ObjVal
+            ),
+
+            "cvar_cost_DKK": (
+                float(self.cvar_cost.getValue())
+                if self.cvar_cost is not None
+                else None
+            ),
+
+            "risk_weight": self.risk_weight,
+            "cvar_alpha": self.cvar_alpha,
+
+            "scenario_costs_DKK": {
+                s: expr.getValue()
+                for s, expr in self.scenario_cost.items()
+            },
+
+            # Expected manager surplus
+            "expected_manager_surplus_DKK": (
+                float(self.expected_manager_surplus.getValue())
+                if self.expected_budget_balance
+                else None
+            ),
+
+            "solver_status": int(self.model.Status),
+            "mip_gap": float(self.model.MIPGap),
+            "runtime_seconds": float(self.model.Runtime),
+        }
+
+

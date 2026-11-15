@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import csv
 import time
 from dataclasses import replace
 from functools import partial
@@ -24,7 +25,7 @@ import gurobipy as gp
 from gurobipy import GRB
 
 from src.data_loader import (load_community, list_communities, with_contract, with_preference_scenario)
-from src.model import (CommunityModel, solve_community, reference_exceedance_range, solve_fixed_price_member, follower_exchange_ranges)
+from src.model import (CommunityModel, solve_community, reference_exceedance_range, solve_fixed_price_member, follower_exchange_ranges, StochasticPricingModel)
 from src.analysis import (
     analyse_reference,
     analyse_individual_contracts,
@@ -1070,6 +1071,7 @@ def main() -> None:
                     help="Evaluate fixed Q2 DP prices under Question 3 preference scenarios")
     ap.add_argument("--q3-scenario-count", type=int, default=5,
                     help="Number of equiprobable Question 3 scenarios (default: 5)")
+    ap.add_argument("--q3-optimize", action="store_true",help="Optimize stochastic dynamic prices")
     ap.add_argument("--q3-seed", type=int, default=1,
                     help="Random seed for Question 3 preference scenarios (default: 1)")
     ap.add_argument("--validate-fixed-prices", action="store_true", help="Validate independent consumer responses against Q2 DP results",)
@@ -1103,6 +1105,11 @@ def main() -> None:
                     help="Regenerate Q2 report figures from saved cap-study and soft-IR outputs; no optimization")
     ap.add_argument("--dp-time-limit", type=float, default=300,
                     help="Per-MILP time limit in the Q2 cap study [seconds]")
+    ap.add_argument("--q3-expected-bb", action="store_true", help="Enforce expected budget balance in stochastic pricing",)
+    ap.add_argument("--q3-expected-ir", action="store_true", help="Enforce expected individual rationality",)
+    ap.add_argument( "--q3-risk-weight", type=float, default=0.0, help="CVaR risk weight (0 = risk-neutral)" )
+    ap.add_argument("--q3-cvar-alpha", type=float, default=0.95, help="CVaR confidence level")
+
     args = ap.parse_args()
     if args.report_plots and (args.sensitivity or args.ir_slack_check or args.feasibility_check
                              or args.q3_scenarios or args.q3_evaluate or args.validate_fixed_prices
@@ -1169,6 +1176,18 @@ def main() -> None:
                 )
 
         return
+    if args.q3_optimize:
+        run_q3_stochastic(
+            community,
+            output_dir,
+            n=args.q3_scenario_count,
+            seed=args.q3_seed,
+            expected_bb=args.q3_expected_bb,
+            expected_ir=args.q3_expected_ir,
+            risk_weight=args.q3_risk_weight,
+            cvar_alpha=args.q3_cvar_alpha,
+        )
+        return
     if args.q3_evaluate:
         run_q3_fixed_price_evaluation(
             community,
@@ -1218,6 +1237,385 @@ def main() -> None:
     if args.demo:
         import runpy
         runpy.run_module("src.scenario_generation", run_name="__main__")
+
+def diagnose_q3_responses(optimization, evaluation, prices, community):
+        """Compare optimistic KKT and independent LP responses."""
+
+        member_rows = []
+        hourly_rows = []
+        T = range(len(prices))
+        cap = np.asarray(community.contract.capacity_limit_kW)
+
+        for scenario in evaluation["scenarios"]:
+            s = scenario["id"]
+
+            for cid, independent in scenario["member_results"].items():
+                block = optimization.blocks[s, cid]
+
+                # Consumer schedule selected by the optimistic model
+                optimistic_net = np.array([
+                    block.net_exchange[t].getValue() for t in T
+                ])
+
+                # Consumer objective under the optimistic schedule
+                optimistic_cost = float(
+                    np.dot(prices, optimistic_net)
+                    + block.physical_cost.getValue()
+                    + block.disutility_cost.getValue()
+                )
+
+                # Consumer objective from KKT duality
+                dual_cost = float(
+                    optimization.follower_cost[s, cid].getValue()
+                )
+
+                # Independently optimized consumer objective
+                independent_cost = float(independent.objective_DKK)
+
+                member_rows.append({
+                    "scenario": s,
+                    "consumer_id": cid,
+                    "optimistic_cost_DKK": optimistic_cost,
+                    "independent_cost_DKK": independent_cost,
+                    "objective_difference_DKK": (
+                        independent_cost - optimistic_cost
+                    ),
+                    "duality_error_DKK": dual_cost - optimistic_cost,
+                    "maximum_exchange_difference_kW": float(
+                        np.max(np.abs(
+                            optimistic_net - independent.net_exchange_kW
+                        ))
+                    ),
+                })
+
+            # Compare feeder imports hour by hour
+            optimistic_import = np.array([
+                optimization.imports[s][t].X for t in T
+            ])
+
+            independent_import = scenario["community"]["community_import_kW"]
+
+            for t in T:
+                hourly_rows.append({
+                    "scenario": s,
+                    "hour": t + 1,
+                    "price_DKK_per_kWh": float(prices[t]),
+                    "optimistic_import_kW": float(optimistic_import[t]),
+                    "independent_import_kW": float(independent_import[t]),
+                    "cap_kW": float(cap[t]),
+                })
+
+        return member_rows, hourly_rows
+
+
+def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, expected_ir=False, risk_weight=0.0, cvar_alpha=0.95,):
+
+    # 1. Generate training scenarios
+    scenarios = prepare_q3_scenarios(
+        community, n=n, seed=seed
+    )
+
+    # 2. Optimize stochastic prices
+
+    # Reference costs for Expected IR
+    reference_costs_DKK = None
+
+    if expected_ir:
+        reference_costs_DKK = {}
+
+        for scenario in scenarios:
+            s = scenario["id"]
+
+            # Use scenario-specific reference loads and minimum energy
+            scenario_community = replace(
+                community,
+                members=scenario["members"],
+            )
+
+            # Model R: no community contract
+            reference_results = solve_community(
+                scenario_community,
+                model_type="R",
+            )
+
+            reference_costs_DKK[s] = {
+                cid: float(member_result.objective_DKK)
+                for cid, member_result in reference_results.items()
+            }
+
+        print("Scenario-specific Model R benchmarks computed")
+
+    optimization = StochasticPricingModel(
+        community, scenarios, verbose=True, expected_budget_balance=expected_bb, expected_individual_rationality=expected_ir, reference_costs_DKK=reference_costs_DKK,
+        risk_weight=risk_weight, cvar_alpha=cvar_alpha,
+    ).build()
+
+    result = optimization.solve()
+
+
+    # Validate Expected IR
+    max_ir_violation = None
+
+    if expected_ir:
+        ir_margins = {}
+
+        for cid in community.member_ids:
+            expected_dp = sum(
+                float(s["probability"])
+                * optimization.follower_cost[
+                    s["id"], cid
+                ].getValue()
+                for s in scenarios
+            )
+
+            expected_r = sum(
+                float(s["probability"])
+                * reference_costs_DKK[s["id"]][cid]
+                for s in scenarios
+            )
+
+            ir_margins[cid] = expected_dp - expected_r
+
+        max_ir_violation = max(
+            0.0, max(ir_margins.values())
+        )
+
+        print("\n=== EXPECTED IR VALIDATION ===")
+        print(
+            f"Maximum expected IR violation: "
+            f"{max_ir_violation:.8f} DKK"
+        )
+        print(
+            "Expected IR validation:",
+            "PASS" if max_ir_violation <= 1e-5 else "FAIL"
+        )
+
+
+    # 3. Independent in-sample evaluation
+    in_sample_evaluation = evaluate_fixed_prices_under_uncertainty(
+        community, result["prices"], scenarios
+    )
+
+    # 4. Validate individual consumer responses
+    member_diagnostics, hourly_diagnostics = diagnose_q3_responses(
+        optimization,
+        in_sample_evaluation,
+        result["prices"],
+        community,
+    )
+
+    max_cost_error = max(
+        abs(row["objective_difference_DKK"])
+        for row in member_diagnostics
+    )
+
+    max_duality_error = max(
+        abs(row["duality_error_DKK"])
+        for row in member_diagnostics
+    )
+
+    max_exchange_difference = max(
+        row["maximum_exchange_difference_kW"]
+        for row in member_diagnostics
+    )
+
+    print("\n=== Q3 FOLLOWER VALIDATION ===")
+    print(f"Maximum objective difference: {max_cost_error:.8f} DKK")
+    print(f"Maximum duality error: {max_duality_error:.8f} DKK")
+    print(f"Maximum exchange difference: {max_exchange_difference:.4f} kW")
+
+    if max(max_cost_error, max_duality_error) > 1e-4:
+        raise AssertionError(
+            "KKT and independent LP objectives differ"
+        )
+
+    print("Follower optimality validation: PASS")
+
+    # 5. Compare community costs for the same scenarios
+    print("\n=== IN-SAMPLE COMMUNITY COMPARISON ===")
+
+    for scenario in in_sample_evaluation["scenarios"]:
+        s = scenario["id"]
+
+        optimistic = result["scenario_costs_DKK"][s]
+        independent = scenario["community"]["total_objective_DKK"]
+
+        print(
+            f"Scenario {s}: "
+            f"Optimistic = {optimistic:.2f} DKK | "
+            f"Independent = {independent:.2f} DKK | "
+            f"Difference = {independent - optimistic:+.2f} DKK"
+        )
+
+    # 6. Independent deterministic baseline
+    baseline = evaluate_fixed_prices_under_uncertainty(
+        community,
+        result["prices"],
+        prepare_q3_scenarios(community, n=1, seed=seed),
+    )
+
+    # 7. Independent out-of-sample evaluation
+    test_scenarios = prepare_q3_scenarios(
+        community, n=100, seed=999
+    )
+
+    evaluation = evaluate_fixed_prices_under_uncertainty(
+        community,
+        result["prices"],
+        test_scenarios,
+    )
+
+    # 8. Print summary
+    print("\n=== Q3 STOCHASTIC RESULTS ===")
+
+    print(
+        "Optimistic in-sample cost:",
+        result["expected_cost_DKK"]
+    )
+
+    print(
+        "Independent in-sample cost:",
+        in_sample_evaluation["expected_community_objective_DKK"]
+    )
+
+    print(
+        "Independent deterministic cost:",
+        baseline["expected_community_objective_DKK"]
+    )
+
+    print(
+        "Out-of-sample expected cost:",
+        evaluation["expected_community_objective_DKK"]
+    )
+
+    print(
+        "Out-of-sample cap violation probability:",
+        evaluation["probability_of_capacity_exceedance"]
+    )
+
+    print( "Expected manager surplus:", result["expected_manager_surplus_DKK"])
+    print("Risk weight:", result["risk_weight"])
+    print("CVaR alpha:", result["cvar_alpha"])
+    print("In-sample CVaR [DKK]:", result["cvar_cost_DKK"])
+    print(
+        "Risk-adjusted objective [DKK]:",
+        result["risk_adjusted_objective_DKK"]
+    )
+    print("Solver status:", result["solver_status"])
+    print("MIP gap:", result["mip_gap"])
+
+    # 9. Prepare output directory
+    if expected_bb and expected_ir:
+        variant = "RN_expected_BB_IR"
+    elif expected_bb:
+        variant = "RN_expected_BB"
+    elif expected_ir:
+        variant = "RN_expected_IR"
+    else:
+        variant = "RN_cap_only"
+
+    if risk_weight > 0:
+        cvar_label = (
+            f"CVaR_a{cvar_alpha:g}_lambda{risk_weight:g}"
+            .replace(".", "p")
+        )
+        variant = f"{variant}_{cvar_label}"
+
+    result_path = (
+        Path(output_dir) / "Q3" / "stochastic"
+        / f"{variant}_N{n}_seed{seed}.json"
+    )
+
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 10. Save member diagnostics
+    member_path = (
+        result_path.parent
+        / f"member_diagnostics_{variant}_N{n}_seed{seed}.csv"
+    )
+
+    with member_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=member_diagnostics[0].keys()
+        )
+        writer.writeheader()
+        writer.writerows(member_diagnostics)
+
+    # 11. Save hourly diagnostics
+    hourly_path = (
+        result_path.parent
+        / f"hourly_diagnostics_{variant}_N{n}_seed{seed}.csv"
+    )
+
+    with hourly_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=hourly_diagnostics[0].keys()
+        )
+        writer.writeheader()
+        writer.writerows(hourly_diagnostics)
+
+    # 12. Save JSON results
+    payload = {
+        "in_sample_count": n,
+        "in_sample_seed": seed,
+        "out_of_sample_count": 100,
+        "out_of_sample_seed": 999,
+
+        "prices_DKK_per_kWh": result["prices"].tolist(),
+
+        "in_sample_expected_cost_DKK":
+            result["expected_cost_DKK"],
+
+        "independent_in_sample_cost_DKK":
+            in_sample_evaluation["expected_community_objective_DKK"],
+
+        "independent_deterministic_cost_DKK":
+            baseline["expected_community_objective_DKK"],
+
+        "in_sample_scenario_costs_DKK":
+            result["scenario_costs_DKK"],
+
+        "out_of_sample_expected_cost_DKK":
+            evaluation["expected_community_objective_DKK"],
+
+        "out_of_sample_cap_violation_probability":
+            evaluation["probability_of_capacity_exceedance"],
+
+        "maximum_follower_cost_error_DKK": max_cost_error,
+        "maximum_duality_error_DKK": max_duality_error,
+        "maximum_exchange_difference_kW": max_exchange_difference,
+
+        "solver_status": result["solver_status"],
+        "mip_gap": result["mip_gap"],
+        "runtime_seconds": result["runtime_seconds"],
+
+        "scenarios": [
+            {
+                "id": s["id"],
+                "probability": s["probability"],
+                "theta": s["theta"],
+            }
+            for s in scenarios
+        ],
+        "expected_budget_balance": expected_bb,
+        "expected_manager_surplus_DKK": result["expected_manager_surplus_DKK"],
+        "expected_individual_rationality": expected_ir,
+        "maximum_expected_ir_violation_DKK": max_ir_violation,
+        "risk_weight": result["risk_weight"],
+        "cvar_alpha": result["cvar_alpha"],
+        "in_sample_cvar_DKK": result["cvar_cost_DKK"],
+        "risk_adjusted_objective_DKK": result["risk_adjusted_objective_DKK"],
+    }
+
+    result_path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8"
+    )
+
+    print(f"\nResults saved to: {result_path}")
+
+    return result
+
 
 
 if __name__ == "__main__":
