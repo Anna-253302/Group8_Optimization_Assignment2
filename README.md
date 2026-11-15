@@ -289,6 +289,44 @@ variants. A proven infeasible result is distinguished from a time limit without
 an incumbent; neither produces a successful result JSON. A time-limited feasible
 incumbent reports its actual status/gap. No requirements are automatically relaxed.
 
+To diagnose the unresolved BB+IR case, run the two-stage warm-start experiment:
+
+```bash
+python main.py --model DP --day d1 --budget-balance --individual-rationality --ir-slack-check --bb-warm-start
+```
+
+Stage 1 solves BB without IR, with the normal community-cost objective and a
+300-second limit. It validates actual payments against the external bill,
+follower dual bills, metered imports/exports and exact cap exceedance. Stage 2
+uses the **same model**, adds one nonnegative IR slack per member and minimizes
+their sum for up to another 300 seconds. All Stage 1 primal, dual and binary
+values are supplied as a complete MIP start; variables remain free to change.
+If Stage 1 finds no incumbent, the diagnosis remains unresolved and Stage 2
+is not run. No tariff, cap, battery or price-bound assumption is changed.
+
+Files are saved under
+`results/<community>/<day>/DP/diagnostics/bb_ir_delta_0/`:
+
+| File | Purpose |
+|---|---|
+| `bb.log`, `ir_slack.log` | Separate solver logs; check the second for acceptance of the MIP start |
+| `bb_start.sol` | Full BB solution, including KKT duals and binaries |
+| `ir_slack_best.sol` | Full validated slack solution, if found |
+| `diagnosis.json` | BB seed, solver status/bound/gap, actual community cost, member violations/slacks and accounting checks |
+
+Keep the base-case bounds first (`delta=0`). A later
+`--price-bound-extension 0.5` run is saved separately as `bb_ir_delta_0p5`.
+Repeated runs at the same delta reuse the same filenames (Gurobi may append
+to existing logs); retain the preceding run separately if it is needed.
+
+A validated solution with actual IR violations within tolerance establishes
+BB+IR feasibility. A certified positive lower bound on total slack rules out
+exact zero slack under the chosen assumptions. A positive-slack incumbent
+with a zero lower bound leaves feasibility unresolved. Excess slack in an
+early incumbent is allowed: actual IR violations must be covered by the
+slacks, but the slacks need not already be minimal. The run uses R as the
+outside option and does not introduce individual compensation transfers.
+
 Analysis checks hourly power balance, nonnegative meter flows, actual positive-part
 cap exceedance, both community cost breakdowns, member bills, payment aggregation,
 the manager accounting identity and C's lower-bound cost. Checks use absolute
@@ -605,3 +643,109 @@ As in Assignment 1: keep data loading, model building, solving and plotting sepa
 and save its outputs under `results/`; fix and report the seeds of every scenario set; and commit regularly with
 meaningful messages - the git history is also a record of everyone's contribution. The graders should be able to open
 the code, follow this README, and reproduce every number and figure of the report.
+# Q2 cap study and response nonuniqueness
+
+Use the same model and input data to compare cap-only DP, BB and BB+IR:
+
+```bash
+python main.py --model DP --day d1 --sensitivity cap --cap-factors 1 1.3 2.5 6 --dp-time-limit 300
+```
+
+The runner solves R once and I/C at each contract. It verifies C's supporting
+prices against independent follower LPs before using them as a cap-only witness.
+The C objective is a lower bound, so a supported C schedule certifies the
+cap-only optimum without a redundant MILP. These are constructive certificates,
+not fabricated solver statuses. If a witness already meets BB and IR it is
+retained; otherwise a time-limited Gurobi MILP searches for the missing variant.
+If C exceeds the sum of R costs, exact BB plus IR is impossible by aggregate
+affordability, and the hard-IR search is skipped with that certificate.
+
+Outputs are in `results/base/d1/DP/cap_study`: a strict JSON study, comparison CSV,
+matched case JSONs, plots, and the base-price follower exchange-range CSV.
+Each returned pricing schedule is checked physically and against independently
+solved follower optima. Indifference uses an objective tolerance of 1e-7 DKK and
+a quantity threshold of 1e-4 kW; different schedules alone do not identify ties.
+The range plot shows per-hour possibilities, not one schedule reaching every
+endpoint simultaneously. The selected duals and schedules may change between
+solvers or optimal solutions; aggregate optimal costs need not change.
+
+Keep `PROVEN_INFEASIBLE`, `UNRESOLVED`, `FEASIBLE_INCUMBENT` and
+`OPTIMAL_CERTIFICATE` distinct. Missing candidates are exported as null, never
+zero. A positive soft-IR incumbent is an upper bound on the required relaxation,
+not a hard-IR solution. Existing soft-IR diagnostics remain separate:
+
+```bash
+python main.py --model DP --day d1 --budget-balance --individual-rationality --ir-slack-check --bb-warm-start
+python -m unittest discover -s tests -p test_dp_analysis.py -q
+```
+
+The study requires an unrestricted/academic Gurobi licence. No new `src` modules
+or alternative production solver have been introduced.
+
+## Q2 report figures from saved results
+
+After the cap study and the saved warm-start soft-IR diagnostic, regenerate all
+report figures without rerunning optimization:
+
+```bash
+python main.py --day d1 --report-plots
+```
+
+This reads the matched base-case JSONs in `DP/cap_study/f_1.3`, the cap-study ledger,
+and `DP/diagnostics/bb_ir_delta_0/diagnosis.json` plus `ir_slack_best.sol` under
+`results/base/d1`. It validates the checkpoint's physical schedules, actual bills,
+outside options and budget against the recorded diagnosis. Day/cap/tariff
+mismatches are rejected. Missing required inputs must be generated first.
+
+Outputs are in `results/base/d1/DP/report`:
+
+- `hourly_prices_imports.pdf/png`: aligned posted prices and signed net exchange;
+  negative net imports are exports. Curves are steps over one-hour intervals.
+- `member_gains.pdf/png`: four disutility-class panels with common scales and
+  asset order Load, PV, BAT, PV+BAT. Gains are relative to R.
+- `cap_study.pdf/png`: discrete sampled cap cases; filled markers are certified
+  optima, open markers are incumbents. Vertical intervals are solver lower-to-upper
+  bounds, not statistical error bars. The status row distinguishes impossible
+  and unresolved hard IR. Peak markers describe the same selected candidates.
+- `appendix/response_ranges.pdf/png` and a price/dispatch comparison for the first
+  tested higher-cap optimal BB+IR case, if present.
+- `selected_runs.json` with source hashes, `base_comparison.csv`, and generated
+  `base_comparison.tex` / `cap_comparison.tex` table bodies. These keep the report
+  tied to the same runs as its figures.
+
+The soft-IR slack bound is kept separate from community-cost bounds. The figures
+do not turn a time-limited candidate into a proven optimum or positive soft-IR
+loss into an infeasibility proof. Diagnostic checkpoint inputs are not modified.
+Use the exported PDFs in the report and copy the table bodies alongside them.
+
+## Figure style for the report
+
+Figures have no descriptive titles or in-figure explanatory footnotes. Keep
+axis labels, units, legends and data annotations; explain the figure in its
+LaTeX caption. Multi-panel figures have only letter markers (a), (b), and so on
+in reading order. Member-gain panels follow ascending disutility classes; the
+base-case captions identify (a)--(d) as L1--L4.
+
+The grey patch in the Q2 price legend is labelled `External export-to-import
+band`. Its dotted lower edge is external net export revenue,
+`p - (1-beta)*export_tariff`; its dashed upper edge is external import cost,
+`p + (1-beta)*import_tariff`, before cap-exceedance penalties. The band is an
+external trading-price reference. The posted-price upper bound also includes
+the exceedance penalty.
+
+These rules apply to all plotting functions, including Q1 sensitivity and
+settlement diagnostics. Regenerate the relevant experiment with the commands
+above; `python main.py --day d1 --report-plots` regenerates the Q2 figures from
+saved results.
+
+## Consistent figure typography
+
+All report plots use Figure 5's approved font roles: 9 pt axis labels, 8 pt
+tick labels and legends, and 10 pt panel letters, in DejaVu Sans. Data
+annotations and status-table entries use 8 pt. Every PDF has the same physical
+width of 476.4 PDF points. Include each report figure at `0.9\textwidth` so
+LaTeX applies the same scale to its text. The common export helper retains
+these sizes and checks that content fits instead of silently clipping it.
+
+Q1 now uses the same style and export helper as Q2. Descriptive titles remain
+in the LaTeX captions. No model, objective, contract or solver setting changes.

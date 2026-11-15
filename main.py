@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
@@ -23,7 +24,7 @@ import gurobipy as gp
 from gurobipy import GRB
 
 from src.data_loader import (load_community, list_communities, with_contract, with_preference_scenario)
-from src.model import (CommunityModel, solve_community, reference_exceedance_range, solve_fixed_price_member)
+from src.model import (CommunityModel, solve_community, reference_exceedance_range, solve_fixed_price_member, follower_exchange_ranges)
 from src.analysis import (
     analyse_reference,
     analyse_individual_contracts,
@@ -36,10 +37,14 @@ from src.analysis import (
     analyse_contract_sensitivity,
     export_contract_sensitivity,
     analyse_dp,
+    validate_dp_responses, dp_study_row, export_dp_study,
+    load_dp_report_data,
     export_dp_analysis,
     evaluate_fixed_prices_under_uncertainty,
 )
-from src.plotting import plot_feeder_import, plot_settlement, plot_contract_sensitivity
+from src.plotting import (plot_feeder_import, plot_settlement, plot_contract_sensitivity,
+                          plot_dp_contract_study, plot_dp_member_comparison, plot_dp_response_ranges,
+                          plot_dp_price_dispatch)
 from src import scenario_generation as sg
 
 
@@ -265,8 +270,15 @@ def diagnose_bb_ir_feasibility(community, reference_results, *, price_bound_exte
         model.dispose()
 
 
-def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension: float = 0.0):
-    """Minimize IR violations in an isolated diagnostic with hard BB intact."""
+def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension: float = 0.0,
+                         bb_warm_start: bool = False, output_dir=None):
+    """Minimize IR violations (DKK), optionally reusing a validated BB incumbent.
+
+    Warm mode solves BB first, then adds IR slacks to the SAME model. All old
+    primal, dual and binary values become starts, never fixed bounds. Each
+    solve has a 300-second limit. Optional output_dir retains logs, full .sol
+    checkpoints and a JSON diagnosis; ordinary Q1/Q2 result files are untouched.
+    """
     reference_costs = {cid: float(result.objective_DKK) for cid, result in reference_results.items()}
     if set(reference_costs) != set(community.member_ids):
         raise ValueError('Reference costs must match all community members')
@@ -276,17 +288,85 @@ def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension
         community, model_type='DP', budget_balance=True, individual_rationality=False,
         verbose=True, price_bound_extension=price_bound_extension)
     model = optimization.model
+    directory = Path(output_dir) if output_dir is not None else None
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    def save_report(report):
+        if directory is not None:
+            (directory / 'diagnosis.json').write_text(
+                json.dumps(report, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+        return report
+
     try:
         optimization.build()
         model.update()
         original_objective = model.getObjective()
         member_ids = list(optimization.blocks)
+        seed_report, start_values, start_slacks = None, [], {}
+        if bb_warm_start:
+            if directory is not None:
+                model.Params.LogFile = str(directory / 'bb.log')
+            model.Params.TimeLimit = 300
+            print('\n=== STAGE 1: FIND A BUDGET-BALANCED START ===')
+            model.optimize()
+            seed_report = dict(solver_status=int(model.Status), solution_count=int(model.SolCount),
+                               runtime_seconds=float(model.Runtime))
+            if model.SolCount == 0:
+                conclusion = 'unresolved; no BB incumbent available for the warm start'
+                print(conclusion)
+                return save_report(dict(bb_seed=seed_report, feasibility_conclusion=conclusion))
+            tolerance = 1e-5
+            payments, dual_residuals = 0.0, []
+            for cid, block in optimization.blocks.items():
+                payment = sum(optimization.internal_prices[t].X * block.net_exchange[t].getValue()
+                              for t in optimization.T)
+                bill = payment + block.physical_cost.getValue() + block.disutility_cost.getValue()
+                dual_bill = optimization.follower_dual_objectives[cid].getValue()
+                dual_residuals.append(abs(bill - dual_bill))
+                # Cover either representation; a tiny reserve prevents rounding rejection.
+                start_slacks[cid] = max(0.0, bill - reference_costs[cid],
+                                        dual_bill - reference_costs[cid]) + 1e-8
+                payments += payment
+            imp = np.array([optimization.community_import[t].X for t in optimization.T])
+            exp = np.array([optimization.community_export[t].X for t in optimization.T])
+            excess = np.array([optimization.exceedance[t].X for t in optimization.T])
+            external = (optimization.objective_components['procurement'].getValue()
+                        + optimization.objective_components['penalty'].getValue())
+            residuals = [abs(payments - external), max(dual_residuals),
+                         float(np.max(np.minimum(imp, exp))),
+                         float(np.max(abs(excess - np.maximum(
+                             imp - np.asarray(community.contract.capacity_limit_kW), 0.0))))]
+            valid = bool(np.all(np.isfinite([model.ObjVal, *start_slacks.values(), *residuals]))
+                         and max(residuals) <= tolerance)
+            seed_report.update(community_cost_DKK=float(model.ObjVal),
+                               total_ir_slack_start_DKK=sum(start_slacks.values()),
+                               bb_residual_DKK=payments - external,
+                               maximum_duality_residual_DKK=max(dual_residuals),
+                               validation_passed=valid)
+            if not valid:
+                save_report(dict(bb_seed=seed_report, feasibility_conclusion='BB start failed validation'))
+                raise ValueError('BB start failed payment/duality/meter validation')
+            start_values = [(var, float(var.X)) for var in model.getVars()]
+            if directory is not None:
+                model.write(str(directory / 'bb_start.sol'))
+            print(f'BB start: community cost {model.ObjVal:.6f} DKK; '
+                  f'total IR slack {sum(start_slacks.values()):.6f} DKK')
         slacks = model.addVars(member_ids, lb=0.0, name='ir_slack')
         for cid in member_ids:
             model.addConstr(optimization.follower_dual_objectives[cid]
                             <= reference_costs[cid] + slacks[cid], name=f'ir_relaxed_{cid}')
         # Diagnostic only: the ordinary community-cost objective is unchanged.
         model.setObjective(gp.quicksum(slacks[cid] for cid in member_ids), GRB.MINIMIZE)
+        if bb_warm_start:
+            model.update()
+            for var, value in start_values:
+                var.Start = value
+            for cid in member_ids:
+                slacks[cid].Start = start_slacks[cid]
+            if directory is not None:
+                model.Params.LogFile = str(directory / 'ir_slack.log')
+            print('\n=== STAGE 2: MINIMIZE IR SLACK FROM THE BB START ===')
         model.Params.TimeLimit = 300
         model.Params.MIPFocus = 1
         model.Params.OutputFlag = 1
@@ -305,6 +385,8 @@ def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension
                       solver_status_name=names.get(model.Status, f'STATUS_{model.Status}'),
                       solution_count=model.SolCount, runtime_seconds=model.Runtime,
                       best_bound_DKK=bound)
+        if bb_warm_start:
+            report['bb_seed'] = seed_report
         print('\n=== DP + BB IR-SLACK DIAGNOSTIC ===')
         print(f"Solver status: {report['solver_status_name']} ({model.Status})")
         print(f'Runtime [s]: {model.Runtime:.3f}')
@@ -312,12 +394,13 @@ def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension
         print(f'Best bound [DKK]: {bound if bound is not None else "unavailable"}')
         if model.SolCount > 0:
             tolerance = 1e-5  # Absolute DKK tolerance, with one-hour intervals.
-            rows, payments, local_cost = [], 0.0, 0.0
+            rows, payments, local_cost, dual_residuals = [], 0.0, 0.0, []
             for cid, block in optimization.blocks.items():
                 payment = sum(optimization.internal_prices[t].X * block.net_exchange[t].getValue()
                               for t in optimization.T)
                 local = block.physical_cost.getValue() + block.disutility_cost.getValue()
                 settled = payment + local
+                dual_residuals.append(abs(settled - optimization.follower_dual_objectives[cid].getValue()))
                 rows.append(dict(consumer_id=cid, reference_cost_DKK=reference_costs[cid],
                                  settled_cost_DKK=settled,
                                  ir_violation_DKK=max(0.0, settled - reference_costs[cid]),
@@ -343,7 +426,7 @@ def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension
                                   and row['ir_violation_DKK'] <= row['slack_DKK'] + tolerance
                                   for row in rows)
                           and abs(best_slack - total_slack) <= tolerance
-                          and abs(slack_residual) <= tolerance
+                          and max(dual_residuals) <= tolerance
                           and abs(bb_residual) <= tolerance and abs(cost_residual) <= tolerance)
             report.update(best_total_ir_slack_DKK=best_slack,
                           mip_gap=gap if np.isfinite(gap) else None,
@@ -352,6 +435,7 @@ def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension
                           maximum_ir_violation_DKK=maximum_ir,
                           actual_total_ir_violation_DKK=actual_violation,
                           slack_reconstruction_residual_DKK=slack_residual,
+                          maximum_duality_residual_DKK=max(dual_residuals),
                           objective_residual_DKK=cost_residual,
                           violating_member_count=sum(row['ir_violation_DKK'] > tolerance for row in rows),
                           members=rows, validation_passed=passed)
@@ -370,10 +454,8 @@ def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension
             print(f'Validation: {"PASS" if passed else "FAIL"}')
             if not passed:
                 conclusion = 'candidate failed independent validation; no validated feasibility conclusion'
-            elif total_slack <= tolerance:
+            elif actual_violation <= tolerance:
                 conclusion = 'BB + IR is feasible within numerical tolerances'
-            elif model.Status == GRB.OPTIMAL:
-                conclusion = 'positive optimal total IR slack; hard BB + IR is infeasible within solver tolerances'
             elif bound is not None and bound > tolerance:
                 conclusion = 'positive lower bound rules out zero total IR slack under the current assumptions'
             else:
@@ -385,7 +467,10 @@ def diagnose_bb_ir_slacks(community, reference_results, *, price_bound_extension
             conclusion = 'no feasible diagnostic incumbent; minimum IR relaxation remains unresolved'
             print('No feasible diagnostic incumbent was found.')
         report['feasibility_conclusion'] = conclusion
+        if bb_warm_start and model.SolCount > 0 and report['validation_passed'] and directory is not None:
+            model.write(str(directory / 'ir_slack_best.sol'))
         print(f'Conclusion: {conclusion}')
+        save_report(report)
         if model.SolCount > 0 and not report['validation_passed']:
             raise ValueError('IR-slack candidate failed independent slack/BB/cost validation')
         return report
@@ -529,6 +614,163 @@ def run_contract_sensitivity(
         reports[dimension] = report
     print(f"Sensitivity results saved to {output_dir} ({time.perf_counter() - started:.1f} s)")
     return reports
+
+
+def solve_dp_study_point(community, *, time_limit=300, **options):
+    """Return a DP incumbent and explicit search metadata, including no-incumbent runs."""
+    optimization = CommunityModel(community, model_type='DP', **options).build()
+    m = optimization.model
+    try:
+        m.Params.TimeLimit = time_limit
+        m.optimize()
+        names = {GRB.OPTIMAL:'OPTIMAL', GRB.INFEASIBLE:'INFEASIBLE', GRB.TIME_LIMIT:'TIME_LIMIT',
+                 GRB.INF_OR_UNBD:'INF_OR_UNBD', GRB.INTERRUPTED:'INTERRUPTED'}
+        bound = float(m.ObjBound)
+        meta = dict(status_name=names.get(m.Status, f'STATUS_{m.Status}'), solver='Gurobi',
+                    runtime_seconds=float(m.Runtime), solution_count=int(m.SolCount),
+                    lower_bound_DKK=bound if np.isfinite(bound) else None)
+        return (optimization._extract_results() if m.SolCount else None), meta
+    finally:
+        m.dispose()
+
+
+def central_price_witness(community, centralized):
+    """Construct an optimistic DP witness at C's supporting prices; verify separately."""
+    prices = centralized.balance_duals.copy()
+    members = {}
+    for member in community.members:
+        own = centralized.member_results[member.consumer_id]
+        local = member.pv_marginal_cost*own.pv_kW.sum() + member.linear_disutility*own.deviation_kW.sum()
+        members[member.consumer_id] = replace(own, objective_DKK=float(prices@own.net_exchange_kW+local))
+    return replace(centralized, model_type='DP', member_results=members,
+                   internal_prices=prices, balance_duals=None, solver_status=None,
+                   mip_gap=None, best_bound_DKK=centralized.objective_DKK)
+
+
+def run_dp_contract_sensitivity(community, output_dir, *, cap_factors=None, time_limit=300,
+                                solver=solve_community, dp_solver=solve_dp_study_point,
+                                response_ranges=True):
+    """Q2 cap study: common benchmarks, supporting-price certificates and bounded searches.
+
+    Recompute I/C per contract, keep R fixed, and verify actual follower responses.
+    Impossible hard-IR points are certified by C>R; valid C-price witnesses avoid
+    unnecessary MILPs. Search failure stays unresolved. No price discrimination,
+    transfers, extra physical flexibility or changed billing is introduced.
+    """
+    if not np.isfinite(time_limit) or time_limit <= 0:
+        raise ValueError('Time limit must be positive and finite')
+    factors = sorted(set([1.,1.3,2.5,6.] if cap_factors is None else cap_factors)
+                     | {float(community.contract.capacity_limit_daily_energy_factor)})
+    if len(factors) < 2:
+        raise ValueError('At least two distinct cap factors are required')
+    cases = [with_contract(community, cap_factor=f) for f in factors]
+    folder = Path(output_dir); folder.mkdir(parents=True, exist_ok=True)
+    reference = solver(community, model_type='R')
+    reference_total = sum(v.objective_DKK for v in reference.values())
+    reference_costs = {k:v.objective_DKK for k,v in reference.items()}
+    rows, ranges, records = [], [], []
+    for factor, case in zip(factors, cases):
+        individual = solver(case, model_type='I')
+        central = solver(case, model_type='C')
+        witness = central_price_witness(case, central)
+        witness_checks = validate_dp_responses(case, witness)
+        # analyse_dp also checks bounds, meter accounting and reconstructed costs.
+        witness_analysis = analyse_dp(case, reference, individual, central, witness)
+        witness_analysis.summary.update(optimality_certified=True,
+            optimality_certificate='C lower bound plus independently verified supporting-price witness',
+            solver_status_name='NOT_RUN_CERTIFICATE')
+        point = folder / f'f_{factor:g}'
+        point.mkdir(exist_ok=True)
+        export_dp_analysis(witness_analysis, point)
+        base = dp_study_row(witness_analysis, factor, 'cap_only', outcome='OPTIMAL_CERTIFICATE',
+                            method='C lower bound plus verified supporting-price witness',
+                            lower_bound=central.objective_DKK, optimality_certified=True)
+        rows.append(base)
+        records.append(dict(cap_factor=factor, variant='cap_only', follower_checks=witness_checks))
+        if response_ranges and np.isclose(factor, community.contract.capacity_limit_daily_energy_factor):
+            ranges = [r for m in case.members for r in follower_exchange_ranges(m, witness.internal_prices)]
+            plot_dp_response_ranges(ranges, witness_analysis.hourly, folder)
+        selected = {'C-supported DP':dict(members=witness_analysis.members)}
+        bb = witness if witness_analysis.summary['manager_budget_balanced'] else None
+        for variant in ('BB','BB_IR'):
+            if variant == 'BB_IR' and central.objective_DKK > reference_total+1e-5:
+                row = dict.fromkeys(base)
+                row.update(cap_factor=factor, cap_kW=float(case.contract.capacity_limit_kW[0]),
+                           variant=variant, outcome='PROVEN_INFEASIBLE', method='aggregate affordability: C > R',
+                           C_cost_DKK=central.objective_DKK, R_cost_DKK=reference_total,
+                           I_cost_DKK=base['I_cost_DKK'], lower_bound_DKK=central.objective_DKK,
+                           necessary_soft_IR_DKK=central.objective_DKK-reference_total,
+                           optimality_certified=False)
+                rows.append(row)
+                continue
+            candidate = bb
+            has_ir = candidate is not None and all(
+                candidate.member_results[cid].objective_DKK <= reference_costs[cid]+1e-5 for cid in case.member_ids)
+            if candidate is not None and (variant == 'BB' or has_ir):
+                candidate = replace(candidate, budget_balance=True, individual_rationality=variant=='BB_IR')
+                meta = dict(status_name='FEASIBLE_CERTIFICATE', solver='supporting-price witness',
+                            runtime_seconds=0., lower_bound_DKK=central.objective_DKK)
+            else:
+                options = dict(budget_balance=True)
+                if variant == 'BB_IR':
+                    options.update(individual_rationality=True, reference_costs_DKK=reference_costs)
+                candidate, meta = dp_solver(case, time_limit=time_limit, **options)
+            if candidate is None:
+                row = dict.fromkeys(base)
+                row.update(cap_factor=factor, cap_kW=float(case.contract.capacity_limit_kW[0]),
+                           variant=variant, outcome=('PROVEN_INFEASIBLE' if meta['status_name']=='INFEASIBLE' else 'UNRESOLVED'),
+                           method=meta['solver'], C_cost_DKK=central.objective_DKK, R_cost_DKK=reference_total,
+                           I_cost_DKK=base['I_cost_DKK'], lower_bound_DKK=meta.get('lower_bound_DKK'),
+                           runtime_seconds=meta.get('runtime_seconds'), optimality_certified=False)
+            else:
+                checks = validate_dp_responses(case, candidate)
+                analysis = analyse_dp(case, reference, individual, central, candidate)
+                if variant == 'BB':bb = candidate
+                certified = abs(candidate.objective_DKK-central.objective_DKK) <= 1e-5 or candidate.solver_status==GRB.OPTIMAL
+                analysis.summary.update(optimality_certified=certified, selected_method=meta['solver'])
+                export_dp_analysis(analysis, point)
+                selected[variant] = dict(members=analysis.members)
+                row = dp_study_row(analysis, factor, variant,
+                                   outcome='OPTIMAL_CERTIFICATE' if certified else 'FEASIBLE_INCUMBENT',
+                                   method=meta['solver'], lower_bound=max(central.objective_DKK,meta.get('lower_bound_DKK') or central.objective_DKK),
+                                   runtime=meta.get('runtime_seconds'), optimality_certified=certified)
+                meta['follower_checks'] = checks
+            rows.append(row)
+            records.append(dict(cap_factor=factor, variant=variant, **meta))
+            print(f"Q2 cap={factor:g}, {variant}: {row['outcome']}; cost={row['community_cost_DKK']}", flush=True)
+        export_dp_study(rows, ranges, records, folder)
+        if np.isclose(factor, community.contract.capacity_limit_daily_energy_factor):
+            plot_dp_member_comparison(selected, folder)
+    plot_dp_contract_study(rows, folder)
+    return rows
+
+
+def run_q2_report_plots(community, output_dir):
+    """Regenerate report figures from saved matched outputs, without optimization.
+
+    output_dir is the results day folder. Main figures and auditable data are
+    saved under DP/report, with nonuniqueness/extra-case figures in appendix.
+    """
+    payload = load_dp_report_data(community, output_dir)
+    folder = Path(output_dir)/'DP/report'
+    cases = payload['cases']
+    plot_dp_price_dispatch(cases,folder)
+    plot_dp_member_comparison(cases,folder)
+    plot_dp_contract_study(payload['study']['rows'],folder)
+    plot_dp_response_ranges(payload['ranges'],cases['cap_only']['hourly'],folder/'appendix')
+    base_factor = float(community.contract.capacity_limit_daily_energy_factor)
+    successful = sorted(r['cap_factor'] for r in payload['study']['rows']
+                        if r['variant']=='BB_IR' and r['optimality_certified']
+                        and r['cap_factor']>base_factor)
+    if successful:
+        factor = successful[0]
+        point = Path(output_dir)/'DP/cap_study'/f'f_{factor:g}'
+        comparison = {'cap_only':json.loads((point/'cap_only.json').read_text()),
+                      'BB_IR':json.loads((point/'budget_balance_ir.json').read_text())}
+        plot_dp_price_dispatch(comparison,folder/'appendix',
+                               stem=f'price_dispatch_f_{factor:g}'.replace('.','p'))
+    print(f'Q2 report figures and selected data saved to: {folder}')
+    return payload
 
 
 def validate_fixed_price_response(community, output_dir):
@@ -844,10 +1086,12 @@ def main() -> None:
                              help="Run feasibility-only diagnosis for DP + BB + IR")
     diagnostics.add_argument("--ir-slack-check", action="store_true",
                              help="Minimize individual rationality violations under hard Budget Balance")
+    ap.add_argument("--bb-warm-start", action="store_true",
+                    help="Solve BB first and reuse its full solution for --ir-slack-check")
     ap.add_argument("--settlement", action="store_true",
                     help="Calculate member benefits and manager budget (requires --model all)")
     ap.add_argument("--sensitivity", choices=["discount", "cap", "both"],
-                    help="Run Q1 contract studies (requires --model all)")
+                    help="Q1 studies (--model all), or Q2 cap study (--model DP --sensitivity cap)")
     ap.add_argument("--discount-values", nargs="+", type=float,
                     help="Coarse beta values; base beta is always included")
     ap.add_argument("--cap-factors", nargs="+", type=float,
@@ -855,7 +1099,17 @@ def main() -> None:
     ap.add_argument("--no-refine", action="store_true", help="Skip break-even refinement")
     ap.add_argument("--reference-diagnostics", action="store_true",
                     help="Certify R's exceedance range across alternative economic optima")
+    ap.add_argument("--report-plots", action="store_true",
+                    help="Regenerate Q2 report figures from saved cap-study and soft-IR outputs; no optimization")
+    ap.add_argument("--dp-time-limit", type=float, default=300,
+                    help="Per-MILP time limit in the Q2 cap study [seconds]")
     args = ap.parse_args()
+    if args.report_plots and (args.sensitivity or args.ir_slack_check or args.feasibility_check
+                             or args.q3_scenarios or args.q3_evaluate or args.validate_fixed_prices
+                             or args.settlement or args.reference_diagnostics or args.budget_balance
+                             or args.individual_rationality or args.bb_warm_start
+                             or args.price_bound_extension != 0 or args.dp_time_limit != 300):
+        ap.error('--report-plots reads saved results; do not combine it with solve/diagnostic options')
     if args.q3_scenario_count < 1:
         ap.error("--q3-scenario-count must be a positive integer")
     if args.q3_scenarios and args.q3_evaluate:
@@ -868,19 +1122,30 @@ def main() -> None:
         ap.error('--feasibility-check requires --model DP --budget-balance --individual-rationality')
     if args.ir_slack_check and (args.model != 'DP' or not args.budget_balance or not args.individual_rationality):
         ap.error('--ir-slack-check requires --model DP --budget-balance --individual-rationality')
+    if args.bb_warm_start and not args.ir_slack_check:
+        ap.error('--bb-warm-start requires --ir-slack-check')
     if args.budget_balance and args.model != 'DP':
         ap.error('--budget-balance requires --model DP')
     if args.individual_rationality and (args.model != 'DP' or not args.budget_balance):
         ap.error('--individual-rationality requires --model DP --budget-balance')
-    if args.model == "DP" and (args.settlement or args.sensitivity or args.reference_diagnostics):
-        ap.error("DP has its own analysis; --settlement, --sensitivity and --reference-diagnostics are Q1-only")
-    if (args.settlement or args.sensitivity) and args.model != "all":
+    if args.model == "DP" and (args.settlement or args.reference_diagnostics):
+        ap.error("--settlement and --reference-diagnostics are Q1-only; Q2 uses its own analysis")
+    if args.model == "DP" and args.sensitivity and (args.sensitivity != "cap" or args.budget_balance or args.individual_rationality or args.feasibility_check or args.ir_slack_check or args.price_bound_extension != 0 or args.discount_values or args.no_refine):
+        ap.error("Q2 study requires --model DP --sensitivity cap with unchanged price bounds; it compares all variants")
+    if not np.isfinite(args.dp_time_limit) or args.dp_time_limit <= 0:
+        ap.error("--dp-time-limit must be positive and finite")
+    if args.dp_time_limit != 300 and not (args.model == "DP" and args.sensitivity):
+        ap.error("--dp-time-limit is for --model DP --sensitivity cap")
+    if (args.settlement or args.sensitivity) and args.model not in ("all", "DP"):
         ap.error("--settlement/--sensitivity requires --model all to calculate both member benchmarks")
     if (args.discount_values or args.cap_factors or args.no_refine) and not args.sensitivity:
         ap.error("Sweep values and --no-refine require --sensitivity")
     community = load_community(args.community, day=args.day)
     output_dir = RESULTS_DIR / args.community / args.day
     print(community.summary(), "\n")
+    if args.report_plots:
+        run_q2_report_plots(community,output_dir)
+        return
     if args.q3_scenarios:
         scenarios = prepare_q3_scenarios(
             community,
@@ -915,6 +1180,10 @@ def main() -> None:
     if args.validate_fixed_prices:
         validate_fixed_price_response(community, output_dir)
         return
+    if args.sensitivity and args.model == "DP":
+        run_dp_contract_sensitivity(community, output_dir / "DP" / "cap_study",
+                                    cap_factors=args.cap_factors, time_limit=args.dp_time_limit)
+        return
     if args.sensitivity:
         dimensions = ("discount", "cap") if args.sensitivity == "both" else (args.sensitivity,)
         run_contract_sensitivity(
@@ -930,7 +1199,12 @@ def main() -> None:
     if args.feasibility_check or args.ir_slack_check:
         reference = solve_community(community, model_type='R', verbose=args.verbose_solver)
         if args.ir_slack_check:
-            diagnose_bb_ir_slacks(community, reference, price_bound_extension=args.price_bound_extension)
+            options = dict(price_bound_extension=args.price_bound_extension)
+            if args.bb_warm_start:
+                label = format(args.price_bound_extension, '.12g').replace('.', 'p')
+                options.update(bb_warm_start=True,
+                               output_dir=output_dir / 'DP' / 'diagnostics' / f'bb_ir_delta_{label}')
+            diagnose_bb_ir_slacks(community, reference, **options)
         else:
             diagnose_bb_ir_feasibility(community, reference, price_bound_extension=args.price_bound_extension)
         return
