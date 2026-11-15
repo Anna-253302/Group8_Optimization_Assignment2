@@ -737,3 +737,15 @@ These rules apply to all plotting functions, including Q1 sensitivity and
 settlement diagnostics. Regenerate the relevant experiment with the commands
 above; `python main.py --day d1 --report-plots` regenerates the Q2 figures from
 saved results.
+
+## Consistent figure typography
+
+All report plots use Figure 5's approved font roles: 9 pt axis labels, 8 pt
+tick labels and legends, and 10 pt panel letters, in DejaVu Sans. Data
+annotations and status-table entries use 8 pt. Every PDF has the same physical
+width of 476.4 PDF points. Include each report figure at `0.9\textwidth` so
+LaTeX applies the same scale to its text. The common export helper retains
+these sizes and checks that content fits instead of silently clipping it.
+
+Q1 now uses the same style and export helper as Q2. Descriptive titles remain
+in the LaTeX captions. No model, objective, contract or solver setting changes.

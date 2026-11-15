@@ -1,17 +1,31 @@
 """Plotting functions for Assignment 2."""
 
 from pathlib import Path
+from functools import wraps
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.transforms import Bbox
 
 
 DP_COLORS = {'cap_only':'#0072B2', 'BB':'#E69F00', 'soft_IR':'#CC79A7', 'BB_IR':'#009E73'}
 DP_LABELS = {'cap_only':'C-supported DP', 'BB':'BB', 'soft_IR':'Soft IR', 'BB_IR':'BB+IR'}
-REPORT_STYLE = {'font.size':9, 'axes.labelsize':9, 'axes.titlesize':10,
+REPORT_STYLE = {'font.family':'DejaVu Sans', 'font.size':9, 'axes.labelsize':9, 'axes.titlesize':10,
                 'xtick.labelsize':8, 'ytick.labelsize':8, 'legend.fontsize':8,
                 'axes.spines.top':False, 'axes.spines.right':False,
                 'pdf.fonttype':42, 'ps.fonttype':42}
+# Figure 5's approved PDF width. All report PDFs use this width so inclusion at
+# the same LaTeX width also gives the same printed label/tick/legend sizes.
+REPORT_EXPORT_WIDTH_IN = 476.4 / 72
+
+
+def _report_style(function):
+    """Apply Figure 5's font roles independently of the caller's rc settings."""
+    @wraps(function)
+    def styled(*args,**kwargs):
+        with plt.rc_context(REPORT_STYLE):
+            return function(*args,**kwargs)
+    return styled
 
 
 def _label_panels(axes):
@@ -30,8 +44,17 @@ def _dp_key(label):
 
 
 def _save_report_figure(fig, output_dir, stem):
+    """Export with fixed physical width; fonts retain Figure 5's printed size."""
     folder=Path(output_dir);folder.mkdir(parents=True,exist_ok=True)
-    for ext in ('pdf','png'):fig.savefig(folder/f'{stem}.{ext}',dpi=220,bbox_inches='tight')
+    fig.canvas.draw()
+    tight=fig.get_tightbbox(fig.canvas.get_renderer())
+    if tight.width>REPORT_EXPORT_WIDTH_IN+1e-6:
+        raise ValueError(f'{stem}: figure content exceeds the common export width')
+    center=(tight.x0+tight.x1)/2
+    bounds=Bbox.from_extents(center-REPORT_EXPORT_WIDTH_IN/2,tight.y0-.1,
+                            center+REPORT_EXPORT_WIDTH_IN/2,tight.y1+.1)
+    for ext in ('pdf','png'):
+        fig.savefig(folder/f'{stem}.{ext}',dpi=220,bbox_inches=bounds,pad_inches=0)
     plt.close(fig)
 
 
@@ -155,18 +178,20 @@ def plot_dp_response_ranges(ranges, hourly, output_dir):
     lower=[total('minimum_net_import_kW',h) for h in hours]
     upper=[total('maximum_net_import_kW',h) for h in hours]
     with plt.rc_context(REPORT_STYLE):
-        fig,ax=plt.subplots(figsize=(6.5,2.55),layout='constrained')
+        fig,ax=plt.subplots(figsize=(6.5,2.85),layout='constrained')
         ax.fill_between(edges,np.r_[lower,lower[-1]],np.r_[upper,upper[-1]],step='post',
                         color='#c7e2ef',label='Per-hour response range')
         ax.stairs([r['dp_import_kW']-r['dp_export_kW'] for r in hourly],edges,
                   color=DP_COLORS['cap_only'],lw=1.4,baseline=None,label='Selected C-supported net import')
         ax.stairs([r['cap_kW'] for r in hourly],edges,color='#555555',ls='--',lw=.9,baseline=None,label='Contract cap')
         ax.set(xlabel='Hour',ylabel='Net import [kW]',xlim=(edges[0],edges[-1]))
-        ax.set_xticks([1,4,8,12,16,20,24]);ax.legend(fontsize=7,ncol=3,loc='upper left')
+        ax.set_xticks([1,4,8,12,16,20,24])
+        ax.legend(fontsize=8,ncol=2,loc='lower left',bbox_to_anchor=(0,1.02),borderaxespad=0)
         ax.grid(axis='y',alpha=.17)
         _save_report_figure(fig,output_dir,'response_ranges')
 
 
+@_report_style
 def plot_feeder_import(
     community,
     results,
@@ -198,7 +223,7 @@ def plot_feeder_import(
 
     hours = np.arange(1, len(capacity) + 1)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(6.5, 3.25))
 
     for model_name, model_results in results.items():
 
@@ -252,20 +277,10 @@ def plot_feeder_import(
 
     fig.tight_layout()
 
-    fig.savefig(
-        output_dir / "feeder_import.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
-
-    fig.savefig(
-        output_dir / "feeder_import.pdf",
-        bbox_inches="tight",
-    )
-
-    plt.close(fig)
+    _save_report_figure(fig,output_dir,'feeder_import')
 
 
+@_report_style
 def plot_settlement(result, output_dir):
     """Plot Q1 hourly prices (DKK/kWh) and daily member gains (DKK).
 
@@ -275,7 +290,7 @@ def plot_settlement(result, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     hours = np.array([row["hour"] for row in result.hourly])
-    fig, ax = plt.subplots(figsize=(10, 4.5))
+    fig, ax = plt.subplots(figsize=(6.5, 3.0))
     series = [
         ("day_ahead_price_DKK_per_kWh", "Day-ahead", "#777777", ":"),
         ("discounted_import_price_DKK_per_kWh", "Discounted import", "#1f77b4", "--"),
@@ -294,21 +309,20 @@ def plot_settlement(result, output_dir):
     ax.set(xlabel="Hour of day", ylabel="Price [DKK/kWh]", xlim=(0.5, len(hours) + 0.5))
     ax.set_xticks(hours)
     ax.grid(axis="y", alpha=0.25)
-    ax.legend(ncol=2, fontsize=9)
+    ax.legend(ncol=2, fontsize=8)
     fig.tight_layout()
-    for suffix in ("png", "pdf"):
-        fig.savefig(output_dir / f"settlement_prices.{suffix}", dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    _save_report_figure(fig,output_dir,'settlement_prices')
 
     _plot_member_gains(result.members, output_dir, stem="settlement_member_gains")
 
 
+@_report_style
 def _plot_member_gains(members, output_dir, *, stem, show_assets=False):
     """Daily gains in lettered panels, with disutility classes in sorted order."""
     classes = sorted({row["slope_class"] for row in members})
     ncols = min(2, len(classes))
     nrows = (len(classes) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(10, 3 * nrows), sharey=True, squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.5, 1.9 * nrows), sharey=True, squeeze=False)
     for ax, slope in zip(axes.flat, classes):
         rows = [row for row in members if row["slope_class"] == slope]
         x = np.arange(len(rows))
@@ -329,11 +343,10 @@ def _plot_member_gains(members, output_dir, *, stem, show_assets=False):
     _label_panels(list(axes.flat)[:len(classes)])
     axes[0, 0].legend()
     fig.tight_layout()
-    for suffix in ("png", "pdf"):
-        fig.savefig(output_dir / f"{stem}.{suffix}", dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    _save_report_figure(fig,output_dir,stem)
 
 
+@_report_style
 def plot_contract_sensitivity(rows, output_dir, dimension, base_value, member_count, thresholds=None):
     """Plot contract costs/exceedance and settlement outcomes against beta or f."""
     output_dir = Path(output_dir)
@@ -342,7 +355,7 @@ def plot_contract_sensitivity(rows, output_dir, dimension, base_value, member_co
     colors = {"R": "#1f77b4", "I": "#ff7f0e", "C": "#2ca02c"}
     by_model = {kind: sorted([row for row in rows if row["model"] == kind],
                              key=lambda row: row["parameter_value"]) for kind in colors}
-    fig, axes = plt.subplots(3, 1, figsize=(8.5, 9), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(6.5, 7), sharex=True)
     for kind, records in by_model.items():
         x = [r["parameter_value"] for r in records]
         axes[0].plot(x, [r["total_objective_DKK"] for r in records], color=colors[kind],
@@ -377,13 +390,11 @@ def plot_contract_sensitivity(rows, output_dir, dimension, base_value, member_co
         ax.grid(alpha=.25)
     axes[0].legend(ncol=4)
     fig.tight_layout()
-    for suffix in ("png", "pdf"):
-        fig.savefig(output_dir / f"costs_and_exceedance.{suffix}", dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    _save_report_figure(fig,output_dir,'costs_and_exceedance')
 
     records = by_model["C"]
     x = [r["parameter_value"] for r in records]
-    fig, axes = plt.subplots(2, 1, figsize=(8.5, 6.5), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(6.5, 4.5), sharex=True)
     axes[0].plot(x, [r["manager_surplus_DKK"] for r in records], color=colors["C"], linewidth=2)
     axes[0].axhline(0, color="black", linewidth=.8)
     axes[0].set_ylabel("Manager surplus [DKK/day]")
@@ -400,13 +411,12 @@ def plot_contract_sensitivity(rows, output_dir, dimension, base_value, member_co
         ax.grid(alpha=.25)
     _label_panels(axes)
     fig.tight_layout()
-    for suffix in ("png", "pdf"):
-        fig.savefig(output_dir / f"settlement_sensitivity.{suffix}", dpi=200, bbox_inches="tight")
-    plt.close(fig)
+    _save_report_figure(fig,output_dir,'settlement_sensitivity')
 
     plot_report_contract_sensitivity(rows, output_dir, dimension, base_value, thresholds)
 
 
+@_report_style
 def plot_report_contract_sensitivity(rows, output_dir, dimension, base_value, thresholds=None):
     """Save concise Q1 figures: costs (DKK/day), and cap-study peaks (kW).
 
@@ -430,7 +440,7 @@ def plot_report_contract_sensitivity(rows, output_dir, dimension, base_value, th
     }
     x = [r["parameter_value"] for r in by_model["C"]]
     nrows = 1 if dimension == "discount" else 2
-    fig, axes = plt.subplots(nrows, 1, figsize=(10, 3.6 if nrows == 1 else 6),
+    fig, axes = plt.subplots(nrows, 1, figsize=(6.5, 2.5 if nrows == 1 else 3.9),
                              sharex=True, squeeze=False)
     cost_ax = axes[0, 0]
     for kind, records in by_model.items():
@@ -454,13 +464,13 @@ def plot_report_contract_sensitivity(rows, output_dir, dimension, base_value, th
                     cost_ax.scatter([middle], [reference_cost], color=colors[kind], s=25, zorder=5)
                     cost_ax.annotate(f"{kind} break-even: {middle:.3f}",
                                      xy=(middle, reference_cost), xytext=(12, 16),
-                                     textcoords="offset points", color=colors[kind], fontsize=9,
+                                     textcoords="offset points", color=colors[kind], fontsize=8,
                                      bbox=dict(facecolor="white", edgecolor="none", alpha=.9))
     for ax in axes.flat:
         if min(x) <= base_value <= max(x):
             ax.axvline(base_value, color="#777777", linestyle=":", label="Base contract")
         ax.grid(alpha=.3)
-    cost_ax.legend(ncol=4, fontsize=9)
+    cost_ax.legend(ncol=4, fontsize=8)
     axes[-1, 0].set_xlabel("Tariff discount beta" if dimension == "discount" else "Cap-energy factor f")
     bottom_margin = .02
     if nrows == 2:
@@ -468,8 +478,6 @@ def plot_report_contract_sensitivity(rows, output_dir, dimension, base_value, th
         peak_ax.plot(x, [r["cap_max_kW"] for r in by_model["C"]],
                      color="black", linestyle="-.", linewidth=1.3, label="Hourly cap")
         peak_ax.set_ylabel("Peak metered import [kW]")
-        peak_ax.legend(loc="upper left", fontsize=9)
+        peak_ax.legend(loc="upper left", fontsize=8)
     fig.tight_layout(rect=(0, bottom_margin, 1, 1))
-    for suffix in ("png", "pdf"):
-        fig.savefig(output_dir / f"report_contract_sensitivity.{suffix}", dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    _save_report_figure(fig,output_dir,'report_contract_sensitivity')
