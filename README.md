@@ -308,7 +308,7 @@ to those same prices under uncertain reference-load profiles:
 python main.py --model DP --day d1
 python main.py --q3-evaluate --day d1 --q3-scenario-count 5 --q3-seed 1
 ```
-
+........
 The second command reads the saved DP prices; it does not solve DP again. It
 generates equiprobable joint preference scenarios using the selected day's
 reference profile and uncertainty rules, then solves one independent fixed-price
