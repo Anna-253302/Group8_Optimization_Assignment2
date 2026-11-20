@@ -369,6 +369,32 @@ LPs can have multiple optimal schedules, so the independently selected
 responses (and their aggregate cap outcome) may differ from the deterministic
 DP dispatch even when individual member objectives match.
 
+### 1.8 Question 3: Stochastic solution warm starts
+
+Each Q3 stochastic optimization with a feasible incumbent saves the complete
+Gurobi solution beside its JSON result as a same-stem `.sol` file. To warm-start
+a chance-constrained run, first generate a risk-neutral solution and then run
+the chance-constrained model with the same community, day, scenario count and
+seed:
+
+```bash
+python main.py --q3-optimize --day d1 --q3-scenario-count 2 --q3-seed 1 --q3-risk-weight 0
+python main.py --q3-optimize --day d1 --q3-scenario-count 2 --q3-seed 1 --q3-risk-weight 0 --q3-chance-epsilon 0.5
+```
+
+The program checks the scenario data fingerprint, model settings and solution
+file hash before loading the risk-neutral `.sol` as a MIP start. Existing
+solutions without this metadata are not reused; rerun the risk-neutral command
+to create a verified start. The chance-run `.sol` and JSON use a `CC_...` name,
+so they do not overwrite the `RN_...` baseline. Solver output is also captured
+in a same-stem `.log` file. Check that log for `Loaded user MIP start with
+objective` or `User MIP start produced solution with objective` to confirm that
+Gurobi accepted a feasible incumbent; a loaded start may still be rejected if
+it is infeasible for the chance-constrained model.
+
+The `--q3-evaluate` and `--q3-optimize` commands save their evaluation metrics
+and scenario-level results as JSON. They do not generate analysis figures.
+
 ## 2. Repository structure
 
 The same division of responsibilities as Assignment 1 is used. Experiment
