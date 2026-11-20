@@ -1106,11 +1106,13 @@ def reference_exceedance_range(community, *, tolerance=1e-7):
 
 
 class StochasticPricingModel:
-    """Risk-neutral and CVaR-averse two-stage dynamic pricing."""
+    """Risk-neutral and CVaR-averse two-stage dynamic pricing with optional joint daily chance constraints on community imports."""
 
     def __init__(self, community, scenarios, *, verbose=False, expected_budget_balance=False, expected_individual_rationality=False, reference_costs_DKK=None,
         risk_weight=0.0,
         cvar_alpha=0.95,
+        chance_epsilon=None,
+        time_limit=300,
     ):
         self.community = community
         self.scenarios = list(scenarios)
@@ -1118,12 +1120,29 @@ class StochasticPricingModel:
         # CVaR parameters
         self.risk_weight = float(risk_weight)
         self.cvar_alpha = float(cvar_alpha)
+        self.chance_epsilon = (
+            None if chance_epsilon is None
+            else float(chance_epsilon)
+        )
 
         if not np.isfinite(self.risk_weight) or self.risk_weight < 0:
             raise ValueError("risk_weight must be finite and non-negative")
 
         if not np.isfinite(self.cvar_alpha) or not 0 <= self.cvar_alpha < 1:
             raise ValueError("cvar_alpha must be between 0 (inclusive) and 1 (exclusive)")
+
+        if self.chance_epsilon is not None:
+            if (
+                not np.isfinite(self.chance_epsilon)
+                or not 0 <= self.chance_epsilon <= 1
+            ):
+                raise ValueError(
+                    "chance_epsilon must be between 0 and 1"
+                )
+
+        self.time_limit = float(time_limit)
+        if not np.isfinite(self.time_limit) or self.time_limit <= 0:
+            raise ValueError("time_limit must be positive and finite")
 
         self.expected_budget_balance = expected_budget_balance
         self.expected_individual_rationality = expected_individual_rationality
@@ -1142,7 +1161,7 @@ class StochasticPricingModel:
 
         self.model = gp.Model("SDP_expected_cost")
         self.model.Params.OutputFlag = int(verbose)
-        self.model.Params.TimeLimit = 300
+        self.model.Params.TimeLimit = self.time_limit
         self.model.Params.MIPGap = 1e-3
 
         self.T = range(community.members[0].n_hours)
@@ -1155,6 +1174,39 @@ class StochasticPricingModel:
         self.imports = {}
         self.exports = {}
         self.exceedance = {}
+        self.chance_violation = None
+
+    def _build_chance_constraints(self):
+        if self.chance_epsilon is None:
+            return
+
+        scenario_ids = [scenario["id"] for scenario in self.scenarios]
+        self.chance_violation = self.model.addVars(
+            scenario_ids,
+            vtype=GRB.BINARY,
+            name="chance_violation"
+        )
+
+        cap = self.community.contract.capacity_limit_kW
+
+        for scenario in self.scenarios:
+            s = scenario["id"]
+
+            for t in self.T:
+                self.model.addGenConstrIndicator(
+                    self.chance_violation[s], 0,
+                    self.imports[s][t] <= float(cap[t]),
+                    name=f"chance_cap_s{s}_t{t}"
+                )
+
+        self.model.addConstr(
+            gp.quicksum(
+                float(scenario["probability"])
+                * self.chance_violation[scenario["id"]]
+                for scenario in self.scenarios
+            ) <= self.chance_epsilon,
+            name="chance_probability"
+        )
 
     def build(self):
         m, T, community = self.model, self.T, self.community
@@ -1261,6 +1313,7 @@ class StochasticPricingModel:
                 for cid in community.member_ids
             )
 
+        self._build_chance_constraints()
 
         # Expected budget balance
         if self.expected_budget_balance:
@@ -1407,12 +1460,67 @@ class StochasticPricingModel:
     def solve(self):
         self.model.optimize()
 
+        solver_status = int(self.model.Status)
+        runtime_seconds = float(self.model.Runtime)
+
         if self.model.SolCount == 0:
-            raise RuntimeError(
-                f"No SDP solution found; status={self.model.Status}"
+            return {
+                "has_solution": False,
+                "prices": None,
+                "expected_cost_DKK": None,
+                "risk_adjusted_objective_DKK": None,
+                "cvar_cost_DKK": None,
+                "risk_weight": self.risk_weight,
+                "cvar_alpha": self.cvar_alpha,
+                "scenario_costs_DKK": None,
+                "expected_manager_surplus_DKK": None,
+                "solver_status": solver_status,
+                "mip_gap": None,
+                "runtime_seconds": runtime_seconds,
+                "time_limit_seconds": self.time_limit,
+                "chance_epsilon": self.chance_epsilon,
+                "chance_violation_indicators": None,
+                "chance_allowed_probability": None,
+                "chance_actual_violation_probability": None,
+                "chance_constraint_satisfied": None,
+            }
+
+        chance_violation_indicators = None
+        chance_allowed_probability = None
+        chance_actual_violation_probability = None
+        chance_constraint_satisfied = None
+
+        if self.chance_epsilon is not None:
+            chance_violation_indicators = {
+                scenario["id"]: int(
+                    round(float(self.chance_violation[scenario["id"]].X))
+                )
+                for scenario in self.scenarios
+            }
+            chance_allowed_probability = sum(
+                float(scenario["probability"])
+                * chance_violation_indicators[scenario["id"]]
+                for scenario in self.scenarios
+            )
+
+            capacity = self.community.contract.capacity_limit_kW
+            feasibility_tolerance = 1e-6
+            chance_actual_violation_probability = sum(
+                float(scenario["probability"])
+                for scenario in self.scenarios
+                if any(
+                    float(self.imports[scenario["id"]][t].X)
+                    > float(capacity[t]) + feasibility_tolerance
+                    for t in self.T
+                )
+            )
+            chance_constraint_satisfied = (
+                chance_actual_violation_probability
+                <= self.chance_epsilon + feasibility_tolerance
             )
 
         return {
+            "has_solution": True,
             "prices": np.array(
                 [self.prices[t].X for t in self.T]
             ),
@@ -1448,7 +1556,13 @@ class StochasticPricingModel:
 
             "solver_status": int(self.model.Status),
             "mip_gap": float(self.model.MIPGap),
-            "runtime_seconds": float(self.model.Runtime),
+            "runtime_seconds": runtime_seconds,
+            "time_limit_seconds": self.time_limit,
+            "chance_epsilon": self.chance_epsilon,
+            "chance_violation_indicators": chance_violation_indicators,
+            "chance_allowed_probability": chance_allowed_probability,
+            "chance_actual_violation_probability": chance_actual_violation_probability,
+            "chance_constraint_satisfied": chance_constraint_satisfied,
         }
 
 

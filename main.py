@@ -13,10 +13,11 @@ settlement and exports are handled by src/analysis.py; figures by plotting.py.
 from __future__ import annotations
 
 import argparse
-import json
 import csv
+import hashlib
+import json
 import time
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from functools import partial
 from pathlib import Path
 
@@ -952,6 +953,25 @@ def run_q3_fixed_price_evaluation(community, output_dir, *, n=5, seed=1):
         "scenario_count": n,
         "seed": seed,
         "uncertain_quantity": "profile",
+        "evaluation_scenario_count": len(evaluation["scenarios"]),
+        "evaluation_scenario_seed": seed,
+        "evaluation_scenario_ids": [
+            int(scenario["id"]) for scenario in evaluation["scenarios"]
+        ],
+        "evaluation_scenario_probabilities": {
+            str(scenario["id"]): float(scenario["probability"])
+            for scenario in evaluation["scenarios"]
+        },
+        "evaluation_scenario_settings": {
+            "uncertain_quantities": ["profile"],
+            "mode": "aligned",
+        },
+        "scenario_costs_DKK": {
+            str(scenario["id"]): float(
+                scenario["community"]["total_objective_DKK"]
+            )
+            for scenario in evaluation["scenarios"]
+        },
         "expected_objective_components_DKK": evaluation[
             "expected_objective_components_DKK"
         ],
@@ -1109,7 +1129,18 @@ def main() -> None:
     ap.add_argument("--q3-expected-ir", action="store_true", help="Enforce expected individual rationality",)
     ap.add_argument( "--q3-risk-weight", type=float, default=0.0, help="CVaR risk weight (0 = risk-neutral)" )
     ap.add_argument("--q3-cvar-alpha", type=float, default=0.95, help="CVaR confidence level")
-
+    ap.add_argument(
+        "--q3-chance-epsilon",
+        type=float,
+        default=None,
+        help="Maximum allowed probability of a joint daily feeder-cap violation."
+    )
+    ap.add_argument(
+        "--q3-time-limit",
+        type=float,
+        default=300,
+        help="Gurobi time limit in seconds for Q3 stochastic optimization."
+    )
     args = ap.parse_args()
     if args.report_plots and (args.sensitivity or args.ir_slack_check or args.feasibility_check
                              or args.q3_scenarios or args.q3_evaluate or args.validate_fixed_prices
@@ -1121,6 +1152,18 @@ def main() -> None:
         ap.error("--q3-scenario-count must be a positive integer")
     if args.q3_scenarios and args.q3_evaluate:
         ap.error("--q3-scenarios and --q3-evaluate are mutually exclusive")
+    if args.q3_chance_epsilon is not None:
+        if (
+            not np.isfinite(args.q3_chance_epsilon)
+            or not 0 <= args.q3_chance_epsilon <= 1
+        ):
+            ap.error("--q3-chance-epsilon must be between 0 and 1")
+        if not args.q3_optimize:
+            ap.error("--q3-chance-epsilon requires --q3-optimize")
+    if not np.isfinite(args.q3_time_limit) or args.q3_time_limit <= 0:
+        ap.error("--q3-time-limit must be positive and finite")
+    if args.q3_time_limit != 300 and not args.q3_optimize:
+        ap.error("--q3-time-limit is for --q3-optimize")
     if not np.isfinite(args.price_bound_extension) or args.price_bound_extension < 0:
         ap.error('--price-bound-extension must be finite and non-negative')
     if args.price_bound_extension != 0 and args.model != 'DP':
@@ -1186,6 +1229,8 @@ def main() -> None:
             expected_ir=args.q3_expected_ir,
             risk_weight=args.q3_risk_weight,
             cvar_alpha=args.q3_cvar_alpha,
+            chance_epsilon=args.q3_chance_epsilon,
+            time_limit=args.q3_time_limit,
         )
         return
     if args.q3_evaluate:
@@ -1308,12 +1353,210 @@ def diagnose_q3_responses(optimization, evaluation, prices, community):
         return member_rows, hourly_rows
 
 
-def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, expected_ir=False, risk_weight=0.0, cvar_alpha=0.95,):
+def _canonical_q3_value(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if is_dataclass(value):
+        return {
+            field.name: _canonical_q3_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_q3_value(value[key])
+            for key in sorted(value, key=str)
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_q3_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(
+        f"Unsupported Q3 scenario fingerprint value: {type(value).__name__}"
+    )
+
+
+def _q3_warm_start_identity(community, scenarios, n, seed):
+    settings = {
+        "uncertain_quantities": ["profile"],
+        "mode": "aligned",
+    }
+    fingerprint_data = {
+        "settings": settings,
+        "community_data": community,
+        "scenarios": scenarios,
+    }
+    canonical = json.dumps(
+        _canonical_q3_value(fingerprint_data),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return {
+        "community": community.community,
+        "day": community.day,
+        "scenario_count": int(n),
+        "seed": int(seed),
+        "scenario_generation_settings": settings,
+        "scenario_data_sha256": hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _q3_stochastic_variant(prefix, expected_bb, expected_ir, risk_weight, cvar_alpha):
+    if expected_bb and expected_ir:
+        variant = f"{prefix}_expected_BB_IR"
+    elif expected_bb:
+        variant = f"{prefix}_expected_BB"
+    elif expected_ir:
+        variant = f"{prefix}_expected_IR"
+    else:
+        variant = f"{prefix}_cap_only"
+
+    if risk_weight > 0:
+        cvar_label = (
+            f"CVaR_a{cvar_alpha:g}_lambda{risk_weight:g}"
+            .replace(".", "p")
+        )
+        variant = f"{variant}_{cvar_label}"
+
+    return variant
+
+
+def _q3_stochastic_result_path(
+    output_dir, variant, n, seed, chance_epsilon
+):
+    result_suffix = f"_N{n}"
+    if chance_epsilon is not None:
+        epsilon_label = f"{chance_epsilon:g}".replace(".", "p")
+        result_suffix += f"_eps{epsilon_label}"
+    result_suffix += f"_seed{seed}"
+    return (
+        Path(output_dir) / "Q3" / "stochastic"
+        / f"{variant}{result_suffix}.json"
+    )
+
+
+def _q3_file_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _submit_q3_mip_start(
+    optimization,
+    source_json_path,
+    source_solution_path,
+    scenario_identity,
+    expected_bb,
+    expected_ir,
+    log_path,
+):
+    start_info = {
+        "submitted": False,
+        "accepted": None,
+        "source_solution": str(source_solution_path),
+        "log_file": None,
+        "reason": None,
+    }
+
+    if not source_solution_path.is_file() or not source_json_path.is_file():
+        start_info["reason"] = "No matching risk-neutral solution and metadata files."
+        print("No matching risk-neutral .sol file; solving without a MIP start.")
+        return start_info
+
+    source_payload = json.loads(
+        source_json_path.read_text(encoding="utf-8")
+    )
+    if (
+        source_payload.get("warm_start_identity") != scenario_identity
+        or source_payload.get("risk_weight") != 0.0
+        or source_payload.get("chance_epsilon") is not None
+        or source_payload.get("expected_budget_balance") != expected_bb
+        or source_payload.get("expected_individual_rationality") != expected_ir
+        or source_payload.get("solution_file_sha256")
+        != _q3_file_sha256(source_solution_path)
+    ):
+        start_info["reason"] = (
+            "Risk-neutral solution metadata or solution-file hash does not match."
+        )
+        print("Ignoring risk-neutral .sol: metadata or solution hash does not match.")
+        return start_info
+
+    model = optimization.model
+    model.Params.LogFile = str(log_path)
+    model.update()
+    model.read(str(source_solution_path))
+
+    capacity = optimization.community.contract.capacity_limit_kW
+    feasibility_tolerance = 1e-6
+    for scenario in optimization.scenarios:
+        s = scenario["id"]
+        imports = []
+        for t in optimization.T:
+            start_value = float(optimization.imports[s][t].Start)
+            if not np.isfinite(start_value) or abs(start_value) >= GRB.INFINITY:
+                raise ValueError(
+                    f"Risk-neutral .sol has no import start for scenario {s}, hour {t}"
+                )
+            imports.append(start_value)
+
+        optimization.chance_violation[s].Start = int(
+            any(
+                imports[t] > float(capacity[t]) + feasibility_tolerance
+                for t in optimization.T
+            )
+        )
+
+    model.update()
+    start_info.update(
+        submitted=True,
+        log_file=str(log_path),
+    )
+    print(
+        "Matching risk-neutral solution loaded by variable name; "
+        "chance-indicator starts set from its imports."
+    )
+    return start_info
+
+
+def _q3_mip_start_acceptance(log_path):
+    log_path = Path(log_path)
+    if not log_path.is_file():
+        return None
+
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if (
+        "Loaded user MIP start with objective" in log_text
+        or "User MIP start produced solution with objective" in log_text
+    ):
+        return True
+    if "User MIP start did not produce a new incumbent solution" in log_text:
+        return False
+    return None
+
+
+def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, expected_ir=False, risk_weight=0.0, cvar_alpha=0.95, chance_epsilon=None, time_limit=300):
 
     # 1. Generate training scenarios
     scenarios = prepare_q3_scenarios(
         community, n=n, seed=seed
     )
+    warm_start_identity = _q3_warm_start_identity(
+        community, scenarios, n, seed
+    )
+
+    variant_prefix = "CC" if chance_epsilon is not None else "RN"
+    variant = _q3_stochastic_variant(
+        variant_prefix, expected_bb, expected_ir, risk_weight, cvar_alpha
+    )
+    result_path = _q3_stochastic_result_path(
+        output_dir, variant, n, seed, chance_epsilon
+    )
+    result_suffix = result_path.stem[len(variant):]
+    result_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 2. Optimize stochastic prices
 
@@ -1348,9 +1591,133 @@ def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, 
     optimization = StochasticPricingModel(
         community, scenarios, verbose=True, expected_budget_balance=expected_bb, expected_individual_rationality=expected_ir, reference_costs_DKK=reference_costs_DKK,
         risk_weight=risk_weight, cvar_alpha=cvar_alpha,
+        chance_epsilon=chance_epsilon, time_limit=time_limit,
     ).build()
 
+    warm_start_info = {
+        "submitted": False,
+        "accepted": None,
+        "source_solution": None,
+        "log_file": None,
+        "reason": "Chance constraints are disabled.",
+    }
+    if chance_epsilon is not None:
+        risk_neutral_variant = _q3_stochastic_variant(
+            "RN", expected_bb, expected_ir, 0.0, cvar_alpha
+        )
+        risk_neutral_json_path = _q3_stochastic_result_path(
+            output_dir, risk_neutral_variant, n, seed, None
+        )
+        warm_start_info = _submit_q3_mip_start(
+            optimization,
+            risk_neutral_json_path,
+            risk_neutral_json_path.with_suffix(".sol"),
+            warm_start_identity,
+            expected_bb,
+            expected_ir,
+            result_path.with_suffix(".log"),
+        )
+
     result = optimization.solve()
+
+    solution_path = result_path.with_suffix(".sol")
+    solution_file_sha256 = None
+    if result["has_solution"]:
+        optimization.model.write(str(solution_path))
+        solution_file_sha256 = _q3_file_sha256(solution_path)
+        print(f"Complete Gurobi solution saved to: {solution_path}")
+
+    if warm_start_info["submitted"]:
+        optimization.model.Params.LogFile = ""
+        warm_start_info["accepted"] = _q3_mip_start_acceptance(
+            warm_start_info["log_file"]
+        )
+        if warm_start_info["accepted"] is True:
+            print("Gurobi accepted a feasible incumbent from the MIP start.")
+        elif warm_start_info["accepted"] is False:
+            print("Gurobi did not accept the MIP start as a feasible incumbent.")
+        else:
+            print(
+                "MIP-start acceptance was not identified in the solver log; "
+                f"inspect {warm_start_info['log_file']}."
+            )
+
+    status_names = {
+        GRB.OPTIMAL: "OPTIMAL",
+        GRB.TIME_LIMIT: "TIME_LIMIT",
+        GRB.INFEASIBLE: "INFEASIBLE",
+        GRB.INF_OR_UNBD: "INF_OR_UNBD",
+        GRB.UNBOUNDED: "UNBOUNDED",
+    }
+    solver_status_name = status_names.get(
+        result["solver_status"], str(result["solver_status"])
+    )
+
+    if not result["has_solution"]:
+        print("\n=== Q3 STOCHASTIC RESULTS ===")
+        if result["solver_status"] == GRB.INFEASIBLE:
+            termination_message = (
+                "Stochastic model is infeasible; no solution values were extracted."
+            )
+        else:
+            termination_message = (
+                "No feasible incumbent; solution values are unavailable."
+            )
+        print(termination_message)
+        print(f"Solver status: {solver_status_name}")
+        print("MIP gap: unavailable (no feasible incumbent)")
+        print(f"Runtime: {result['runtime_seconds']:.2f} s")
+
+        if result["chance_epsilon"] is not None:
+            print("\n=== Q3 CHANCE-CONSTRAINED RESULTS ===")
+            print(f"Chance tolerance epsilon:            {result['chance_epsilon']:.2f}")
+            print("Allowed violation probability:       unavailable")
+            print("Actual in-sample violation prob.:    unavailable")
+            print("Chance constraint satisfied:         unavailable")
+            print(f"Solver status:                       {solver_status_name}")
+            print(f"Runtime:                             {result['runtime_seconds']:.2f} s")
+
+        failure_payload = {
+            "in_sample_count": n,
+            "in_sample_seed": seed,
+            "out_of_sample_count": 100,
+            "out_of_sample_seed": 999,
+            "solution_available": False,
+            "solution_file": None,
+            "termination_message": termination_message,
+            "prices_DKK_per_kWh": None,
+            "in_sample_expected_cost_DKK": None,
+            "independent_in_sample_cost_DKK": None,
+            "independent_deterministic_cost_DKK": None,
+            "in_sample_scenario_costs_DKK": None,
+            "out_of_sample_expected_cost_DKK": None,
+            "out_of_sample_cap_violation_probability": None,
+            "solver_status": result["solver_status"],
+            "solver_status_name": solver_status_name,
+            "mip_gap": None,
+            "runtime_seconds": result["runtime_seconds"],
+            "time_limit_seconds": result["time_limit_seconds"],
+            "expected_budget_balance": expected_bb,
+            "expected_individual_rationality": expected_ir,
+            "risk_weight": result["risk_weight"],
+            "cvar_alpha": result["cvar_alpha"],
+            "in_sample_cvar_DKK": None,
+            "risk_adjusted_objective_DKK": None,
+            "chance_epsilon": result["chance_epsilon"],
+            "chance_violation_indicators": None,
+            "chance_allowed_probability": None,
+            "chance_actual_violation_probability": None,
+            "chance_constraint_satisfied": None,
+            "warm_start_identity": warm_start_identity,
+            "solution_file_sha256": None,
+            "warm_start": warm_start_info,
+        }
+        result_path.write_text(
+            json.dumps(failure_payload, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8"
+        )
+        print(f"\nStatus-only results saved to: {result_path}")
+        return result
 
 
     # Validate Expected IR
@@ -1503,35 +1870,30 @@ def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, 
     )
     print("Solver status:", result["solver_status"])
     print("MIP gap:", result["mip_gap"])
+    print(f"Runtime: {result['runtime_seconds']:.2f} s")
 
-    # 9. Prepare output directory
-    if expected_bb and expected_ir:
-        variant = "RN_expected_BB_IR"
-    elif expected_bb:
-        variant = "RN_expected_BB"
-    elif expected_ir:
-        variant = "RN_expected_IR"
-    else:
-        variant = "RN_cap_only"
-
-    if risk_weight > 0:
-        cvar_label = (
-            f"CVaR_a{cvar_alpha:g}_lambda{risk_weight:g}"
-            .replace(".", "p")
+    if result["chance_epsilon"] is not None:
+        print("\n=== Q3 CHANCE-CONSTRAINED RESULTS ===")
+        print(f"Chance tolerance epsilon:            {result['chance_epsilon']:.2f}")
+        print(
+            "Allowed violation probability:       "
+            f"{result['chance_allowed_probability']:.4f}"
         )
-        variant = f"{variant}_{cvar_label}"
+        print(
+            "Actual in-sample violation prob.:    "
+            f"{result['chance_actual_violation_probability']:.4f}"
+        )
+        print(
+            "Chance constraint satisfied:         "
+            f"{result['chance_constraint_satisfied']}"
+        )
+        print(f"Solver status:                       {solver_status_name}")
+        print(f"Runtime:                             {result['runtime_seconds']:.2f} s")
 
-    result_path = (
-        Path(output_dir) / "Q3" / "stochastic"
-        / f"{variant}_N{n}_seed{seed}.json"
-    )
-
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 10. Save member diagnostics
+    # Save member diagnostics
     member_path = (
         result_path.parent
-        / f"member_diagnostics_{variant}_N{n}_seed{seed}.csv"
+        / f"member_diagnostics_{variant}{result_suffix}.csv"
     )
 
     with member_path.open("w", newline="", encoding="utf-8") as f:
@@ -1544,7 +1906,7 @@ def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, 
     # 11. Save hourly diagnostics
     hourly_path = (
         result_path.parent
-        / f"hourly_diagnostics_{variant}_N{n}_seed{seed}.csv"
+        / f"hourly_diagnostics_{variant}{result_suffix}.csv"
     )
 
     with hourly_path.open("w", newline="", encoding="utf-8") as f:
@@ -1560,6 +1922,11 @@ def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, 
         "in_sample_seed": seed,
         "out_of_sample_count": 100,
         "out_of_sample_seed": 999,
+        "solution_available": True,
+        "solution_file": str(solution_path),
+        "solution_file_sha256": solution_file_sha256,
+        "warm_start_identity": warm_start_identity,
+        "warm_start": warm_start_info,
 
         "prices_DKK_per_kWh": result["prices"].tolist(),
 
@@ -1578,6 +1945,31 @@ def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, 
         "out_of_sample_expected_cost_DKK":
             evaluation["expected_community_objective_DKK"],
 
+        "out_of_sample_scenario_ids": [
+            int(scenario["id"]) for scenario in evaluation["scenarios"]
+        ],
+        "out_of_sample_scenario_probabilities": {
+            str(scenario["id"]): float(scenario["probability"])
+            for scenario in evaluation["scenarios"]
+        },
+        "out_of_sample_scenario_costs_DKK": {
+            str(scenario["id"]): float(
+                scenario["community"]["total_objective_DKK"]
+            )
+            for scenario in evaluation["scenarios"]
+        },
+        "out_of_sample_scenarios": [
+            {
+                "id": int(scenario["id"]),
+                "probability": float(scenario["probability"]),
+                "theta": scenario["theta"],
+            }
+            for scenario in evaluation["scenarios"]
+        ],
+        "out_of_sample_scenario_settings": {
+            "uncertain_quantities": ["profile"],
+            "mode": "aligned",
+        },
         "out_of_sample_cap_violation_probability":
             evaluation["probability_of_capacity_exceedance"],
 
@@ -1588,6 +1980,7 @@ def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, 
         "solver_status": result["solver_status"],
         "mip_gap": result["mip_gap"],
         "runtime_seconds": result["runtime_seconds"],
+        "time_limit_seconds": result["time_limit_seconds"],
 
         "scenarios": [
             {
@@ -1605,6 +1998,13 @@ def run_q3_stochastic(community, output_dir, *, n=5, seed=1, expected_bb=False, 
         "cvar_alpha": result["cvar_alpha"],
         "in_sample_cvar_DKK": result["cvar_cost_DKK"],
         "risk_adjusted_objective_DKK": result["risk_adjusted_objective_DKK"],
+        "chance_epsilon": result["chance_epsilon"],
+        "chance_violation_indicators": result["chance_violation_indicators"],
+        "chance_allowed_probability": result["chance_allowed_probability"],
+        "chance_actual_violation_probability":
+            result["chance_actual_violation_probability"],
+        "chance_constraint_satisfied":
+            result["chance_constraint_satisfied"],
     }
 
     result_path.write_text(
